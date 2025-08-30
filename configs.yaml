@@ -28,6 +28,13 @@ defaults:
   grayscale: False
   prefill: 2500
   reward_EMA: True
+  
+  # Visual reward (default disabled)
+  visual_reward: False
+  visual_encoder: 'ResNet'
+  visual_reward_weight: 0.0
+  visual_episode_length: 1000
+  visual_device: 'auto'
 
   # Model
   dyn_hidden: 512
@@ -175,6 +182,26 @@ memorymaze:
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   task: 'memorymaze_9x9'
+
+retro:
+  steps: 4e5
+  envs: 1                       # Must be 1 for stable-retro (limitation)
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  grayscale: False
+  time_limit: 108000
+  size: [64, 64]               # Changed from 84x84 to 64x64 for ConvDecoder compatibility
+  
+  # Visual reward parameters
+  visual_reward: True           # Enable visual reward
+  visual_encoder: 'CLIP'      # Options: CLIP, ResNet, ViT, DINO (ResNet is most stable)
+  visual_reward_weight: 0.1     # Weight for visual reward (0.0 = disabled)
+  visual_episode_length: 1000   # Episode length for visual reward clustering
+  visual_device: 'auto'         # Device for visual encoder: auto, cpu, cuda, cuda:0, etc.
 
 debug:
   debug: True

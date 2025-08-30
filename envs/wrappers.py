@@ -1,5 +1,10 @@
 import datetime
-import gym
+try:
+    import gymnasium as gym
+    from gymnasium.spaces import Discrete
+except ImportError:
+    import gym
+    from gym.spaces import Discrete
 import numpy as np
 import uuid
 
@@ -12,7 +17,15 @@ class TimeLimit(gym.Wrapper):
 
     def step(self, action):
         assert self._step is not None, "Must reset environment."
-        obs, reward, done, info = self.env.step(action)
+        step_result = self.env.step(action)
+        if len(step_result) == 5:
+            # New gym API
+            obs, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:
+            # Old gym API
+            obs, reward, done, info = step_result
+        
         self._step += 1
         if self._step >= self._duration:
             done = True
@@ -21,9 +34,9 @@ class TimeLimit(gym.Wrapper):
             self._step = None
         return obs, reward, done, info
 
-    def reset(self):
+    def reset(self, **kwargs):
         self._step = 0
-        return self.env.reset()
+        return self.env.reset(**kwargs)
 
 
 class NormalizeActions(gym.Wrapper):
@@ -46,7 +59,14 @@ class NormalizeActions(gym.Wrapper):
 
 class OneHotAction(gym.Wrapper):
     def __init__(self, env):
-        assert isinstance(env.action_space, gym.spaces.Discrete)
+        # Support both gym.spaces.Discrete and gymnasium.spaces.Discrete
+        action_space = env.action_space
+        is_discrete = (
+            isinstance(action_space, Discrete) or 
+            (hasattr(action_space, '__class__') and 
+             action_space.__class__.__name__ == 'Discrete')
+        )
+        assert is_discrete, f"Expected Discrete action space, got {type(action_space)}"
         super().__init__(env)
         self._random = np.random.RandomState()
         shape = (self.env.action_space.n,)
@@ -62,8 +82,8 @@ class OneHotAction(gym.Wrapper):
             raise ValueError(f"Invalid one-hot action:\n{action}")
         return self.env.step(index)
 
-    def reset(self):
-        return self.env.reset()
+    def reset(self, **kwargs):
+        return self.env.reset(**kwargs)
 
     def _sample_action(self):
         actions = self.env.action_space.n
@@ -84,13 +104,23 @@ class RewardObs(gym.Wrapper):
         self.observation_space = gym.spaces.Dict(spaces)
 
     def step(self, action):
-        obs, reward, done, info = self.env.step(action)
+        step_result = self.env.step(action)
+        if len(step_result) == 5:
+            # New gym API
+            obs, reward, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:
+            # Old gym API
+            obs, reward, done, info = step_result
+        
         if "obs_reward" not in obs:
             obs["obs_reward"] = np.array([reward], dtype=np.float32)
         return obs, reward, done, info
 
-    def reset(self):
-        obs = self.env.reset()
+    def reset(self, **kwargs):
+        obs = self.env.reset(**kwargs)
+        if isinstance(obs, tuple):
+            obs = obs[0]  # Handle new gym API
         if "obs_reward" not in obs:
             obs["obs_reward"] = np.array([0.0], dtype=np.float32)
         return obs
@@ -111,7 +141,7 @@ class UUID(gym.Wrapper):
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.id = f"{timestamp}-{str(uuid.uuid4().hex)}"
 
-    def reset(self):
+    def reset(self, **kwargs):
         timestamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
         self.id = f"{timestamp}-{str(uuid.uuid4().hex)}"
-        return self.env.reset()
+        return self.env.reset(**kwargs)

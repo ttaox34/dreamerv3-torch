@@ -477,7 +477,10 @@ class ConvEncoder(nn.Module):
             layers.append(act())
             in_dim = out_dim
             out_dim *= 2
-            h, w = h // 2, w // 2
+            # Calculate actual output size using the same formula as Conv2dSamePad
+            import math
+            h = math.ceil(h / 2)  # stride=2
+            w = math.ceil(w / 2)  # stride=2
 
         self.outdim = out_dim // 2 * h * w
         self.layers = nn.Sequential(*layers)

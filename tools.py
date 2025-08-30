@@ -223,6 +223,11 @@ def simulate(
                     logger.scalar(f"train_episodes", len(cache))
                     logger.write(step=logger.step)
                 else:
+                    # Per-episode logging for evaluation, as requested
+                    logger.scalar(f"eval_return_episode", score)
+                    logger.scalar(f"eval_length_episode", length)
+                    logger.write(step=logger.step)
+
                     if not "eval_lengths" in locals():
                         eval_lengths = []
                         eval_scores = []

@@ -3,6 +3,9 @@ run*
 logdir*
 vis_*
 result*
+eval_logdir*
+metrics*
+stable-retro-docs*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

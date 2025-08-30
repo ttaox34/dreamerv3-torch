@@ -193,6 +193,39 @@ def make_env(config, mode, id):
 
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
+    elif suite == "retro":
+        import envs.stable_retro as stable_retro
+
+        env = stable_retro.StableRetro(
+            game=task,
+            action_repeat=config.action_repeat,
+            size=config.size,
+            grayscale=config.grayscale,
+            seed=config.seed + id,
+        )
+        
+        # Add visual reward wrapper if enabled
+        if getattr(config, 'visual_reward', False) and getattr(config, 'visual_reward_weight', 0.0) > 0.0:
+            try:
+                from envs.visual_reward_wrapper import VisualRewardWrapper
+                
+                visual_device = getattr(config, 'visual_device', 'auto')
+                if visual_device == 'auto':
+                    visual_device = config.device if hasattr(config, 'device') else 'auto'
+                
+                env = VisualRewardWrapper(
+                    env,
+                    visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
+                    visual_reward_weight=getattr(config, 'visual_reward_weight', 0.1),
+                    episode_length=getattr(config, 'visual_episode_length', 1000),
+                    device=visual_device
+                )
+                print(f"Visual reward enabled for retro environment (weight: {config.visual_reward_weight})")
+            except Exception as e:
+                print(f"Warning: Failed to enable visual reward: {e}")
+                print("Continuing without visual reward...")
+        
+        env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
@@ -235,8 +268,19 @@ def main(config):
         directory = config.evaldir
     eval_eps = tools.load_episodes(directory, limit=1)
     make = lambda mode, id: make_env(config, mode, id)
-    train_envs = [make("train", i) for i in range(config.envs)]
-    eval_envs = [make("eval", i) for i in range(config.envs)]
+    
+    # Special handling for retro environments due to single emulator limitation
+    suite, task = config.task.split("_", 1)
+    if suite == "retro":
+        # For retro, create only one environment and reuse for both train and eval
+        print("Warning: Using single environment for both train and eval due to retro emulator limitation")
+        shared_env = make("train", 0)
+        train_envs = [shared_env]
+        eval_envs = [shared_env]  # Reuse the same environment
+    else:
+        train_envs = [make("train", i) for i in range(config.envs)]
+        eval_envs = [make("eval", i) for i in range(config.envs)]
+    
     if config.parallel:
         train_envs = [Parallel(env, "process") for env in train_envs]
         eval_envs = [Parallel(env, "process") for env in eval_envs]
