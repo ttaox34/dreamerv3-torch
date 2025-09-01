@@ -576,6 +576,7 @@ def main():
     parser.add_argument("--configs", nargs="+", help="额外的配置名称（如retro, debug等）")
     parser.add_argument("--device", type=str, default="auto", help="计算设备 (auto, cpu, cuda, cuda:0)")
     parser.add_argument("--visual-reward-weight", type=float, default=0.0, help="视觉奖励权重")
+    parser.add_argument("--output", type=str, help="输出文件路径（可选，默认为当前目录下的时间戳命名文件）")
     
     args = parser.parse_args()
     
@@ -586,6 +587,8 @@ def main():
     print(f"   ⏱️  最大步数: {args.max_steps}")
     print(f"   ⚙️  配置: {args.configs}")
     print(f"   🖥️  设备: {args.device}")
+    if args.output:
+        print(f"   📄 输出文件: {args.output}")
     print()
     
     # 运行评估
@@ -603,9 +606,17 @@ def main():
     if results:
         print_evaluation_summary(results)
     
-    # 保存结果
-    result_file = f"real_model_evaluation_{args.game}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    # 确定输出文件路径
+    if args.output:
+        result_file = args.output
+        # 确保输出目录存在
+        output_dir = pathlib.Path(result_file).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        # 使用默认的时间戳命名
+        result_file = f"real_model_evaluation_{args.game}_{time.strftime('%Y%m%d_%H%M%S')}.json"
     
+    # 保存结果
     with open(result_file, 'w') as f:
         json.dump({
             'metadata': {
@@ -620,7 +631,8 @@ def main():
                 'max_steps': int(args.max_steps),
                 'configs': args.configs,
                 'device': str(args.device),
-                'visual_reward_weight': float(args.visual_reward_weight)
+                'visual_reward_weight': float(args.visual_reward_weight),
+                'output_file': str(result_file)
             },
             'results': results
         }, f, indent=2)

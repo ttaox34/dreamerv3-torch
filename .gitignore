@@ -6,6 +6,8 @@ result*
 eval_logdir*
 metrics*
 stable-retro-docs*
+rl_game*
+/home/zhuolifeng/rl_game/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
