@@ -189,7 +189,7 @@ retro:
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
-  eval_episode_num: 10
+  eval_episode_num: 5
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   grayscale: False

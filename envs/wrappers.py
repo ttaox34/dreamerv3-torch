@@ -16,7 +16,9 @@ class TimeLimit(gym.Wrapper):
         self._step = None
 
     def step(self, action):
-        assert self._step is not None, "Must reset environment."
+        # Auto-reset if step is None (environment was not properly reset)
+        if self._step is None:
+            self._step = 0
         step_result = self.env.step(action)
         if len(step_result) == 5:
             # New gym API
