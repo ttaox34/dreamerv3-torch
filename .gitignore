@@ -1,5 +1,5 @@
 #
-run*
+# run*
 logdir*
 vis_*
 result*
@@ -8,6 +8,8 @@ metrics*
 stable-retro-docs*
 rl_game*
 /home/zhuolifeng/rl_game/
+/data/mingyu/dreamerv3-torch/logdir/
+external-references*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
