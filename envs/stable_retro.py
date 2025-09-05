@@ -10,6 +10,25 @@ try:
     import retro
 except ImportError:
     retro = None
+import os
+import sys
+import threading
+import gc
+
+# Add external references to path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+external_ref_path = os.path.join(current_dir, '..', 'external-references')
+if external_ref_path not in sys.path:
+    sys.path.insert(0, external_ref_path)
+
+try:
+    from retro_env import RetroEnv
+except ImportError:
+    RetroEnv = None
+
+# 全局模拟器管理
+_global_emulator_lock = threading.Lock()
+_global_current_emulator = None
 
 
 class StableRetro(gym.Env):
@@ -62,31 +81,63 @@ class StableRetro(gym.Env):
         self._grayscale = grayscale
         self._seed = seed
         
-        # Create the environment
-        try:
-            self._env = retro.make(
-                game=game,
-                state=state,
-                scenario=scenario,
-                info=info,
-                use_restricted_actions=use_restricted_actions,
-                players=players,
-                inttype=inttype,
-                obs_type=obs_type,
-                render_mode=None,  # Disable rendering to avoid display issues
-            )
-        except TypeError:
-            # Fallback for older versions without render_mode
-            self._env = retro.make(
-                game=game,
-                state=state,
-                scenario=scenario,
-                info=info,
-                use_restricted_actions=use_restricted_actions,
-                players=players,
-                inttype=inttype,
-                obs_type=obs_type,
-            )
+        # Create the environment with global emulator management
+        global _global_emulator_lock, _global_current_emulator
+        
+        with _global_emulator_lock:
+            # Close existing global emulator if any
+            if _global_current_emulator is not None:
+                try:
+                    _global_current_emulator.close()
+                except:
+                    pass
+                _global_current_emulator = None
+            
+            gc.collect()
+            
+            # Create the environment
+            if RetroEnv is not None:
+                # Use the more complete RetroEnv implementation
+                self._env = RetroEnv(
+                    game=game,
+                    state=state,
+                    scenario=scenario,
+                    info=info,
+                    use_restricted_actions=use_restricted_actions,
+                    players=players,
+                    inttype=inttype,
+                    obs_type=obs_type,
+                    render_mode=None,  # Disable rendering to avoid display issues
+                )
+            else:
+                # Fallback to retro.make
+                try:
+                    self._env = retro.make(
+                        game=game,
+                        state=state,
+                        scenario=scenario,
+                        info=info,
+                        use_restricted_actions=use_restricted_actions,
+                        players=players,
+                        inttype=inttype,
+                        obs_type=obs_type,
+                        render_mode=None,  # Disable rendering to avoid display issues
+                    )
+                except TypeError:
+                    # Fallback for older versions without render_mode
+                    self._env = retro.make(
+                        game=game,
+                        state=state,
+                        scenario=scenario,
+                        info=info,
+                        use_restricted_actions=use_restricted_actions,
+                        players=players,
+                        inttype=inttype,
+                        obs_type=obs_type,
+                    )
+            
+            # Update global emulator reference
+            _global_current_emulator = self._env
         
         # Set up observation and action spaces
         self._setup_spaces()
@@ -198,7 +249,38 @@ class StableRetro(gym.Env):
         total_reward = 0.0
         raw_obs = None
         for _ in range(self._action_repeat):
-            step_result = self._env.step(converted_action)
+            step_result = None
+            max_attempts = 3
+            attempt = 0
+            
+            while attempt < max_attempts:
+                try:
+                    # Check if environment has emulator before stepping
+                    if hasattr(self._env, 'em') and self._env.em is not None:
+                        step_result = self._env.step(converted_action)
+                        break
+                    else:
+                        print(f"Emulator missing, attempting recovery (attempt {attempt + 1})...")
+                        self._reinit_env()
+                        attempt += 1
+                except AttributeError as e:
+                    if "'RetroEnv' object has no attribute 'em'" in str(e) or "em" in str(e):
+                        print(f"Emulator error, attempting recovery (attempt {attempt + 1})...")
+                        self._reinit_env()
+                        attempt += 1
+                    else:
+                        raise
+                except Exception as e:
+                    print(f"Unexpected error in retro environment step: {e}")
+                    if attempt < max_attempts - 1:
+                        self._reinit_env()
+                        attempt += 1
+                    else:
+                        raise
+            
+            if step_result is None:
+                raise RuntimeError("Failed to recover emulator after multiple attempts")
+            
             if len(step_result) == 5:
                 # New gym API: (obs, reward, terminated, truncated, info)
                 obs, reward, terminated, truncated, info = step_result
@@ -229,22 +311,49 @@ class StableRetro(gym.Env):
     
     def reset(self, **kwargs):
         """Reset environment"""
-        obs = self._env.reset(**kwargs)
-        if isinstance(obs, tuple):
-            obs = obs[0]  # Handle new gym API that returns (obs, info)
+        max_attempts = 3
+        attempt = 0
         
-        # Store raw observation for visual reward computation
-        self._last_raw_obs = obs.copy() if hasattr(obs, 'copy') else obs
+        while attempt < max_attempts:
+            try:
+                # Check if environment has emulator before resetting
+                if hasattr(self._env, 'em') and self._env.em is not None:
+                    obs = self._env.reset(**kwargs)
+                    if isinstance(obs, tuple):
+                        obs = obs[0]  # Handle new gym API that returns (obs, info)
+                    
+                    # Store raw observation for visual reward computation
+                    self._last_raw_obs = obs.copy() if hasattr(obs, 'copy') else obs
+                    
+                    obs = self._process_observation(obs)
+                    
+                    # Return observation in dict format expected by DreamerV3
+                    return {
+                        "image": obs,
+                        "is_first": True,
+                        "is_last": False,
+                        "is_terminal": False,
+                    }
+                else:
+                    print(f"Emulator missing during reset, attempting recovery (attempt {attempt + 1})...")
+                    self._reinit_env()
+                    attempt += 1
+            except AttributeError as e:
+                if "'RetroEnv' object has no attribute 'em'" in str(e) or "em" in str(e):
+                    print(f"Emulator error during reset, attempting recovery (attempt {attempt + 1})...")
+                    self._reinit_env()
+                    attempt += 1
+                else:
+                    raise
+            except Exception as e:
+                print(f"Unexpected error during reset: {e}")
+                if attempt < max_attempts - 1:
+                    self._reinit_env()
+                    attempt += 1
+                else:
+                    raise
         
-        obs = self._process_observation(obs)
-        
-        # Return observation in dict format expected by DreamerV3
-        return {
-            "image": obs,
-            "is_first": True,
-            "is_last": False,
-            "is_terminal": False,
-        }
+        raise RuntimeError("Failed to reset environment after multiple attempts")
     
     def render(self, mode='human'):
         """Render environment"""
@@ -254,9 +363,107 @@ class StableRetro(gym.Env):
         """Get the last raw unprocessed frame for visual reward computation"""
         return getattr(self, '_last_raw_obs', None)
     
+    def _reinit_env(self):
+        """Reinitialize the retro environment to recover from emulator loss"""
+        global _global_emulator_lock, _global_current_emulator
+        
+        print("Reinitializing retro environment...")
+        
+        # Store current parameters
+        game = self._game
+        state = self._state
+        scenario = self._scenario
+        info = self._info
+        use_restricted_actions = self._use_restricted_actions
+        players = self._players
+        inttype = self._inttype
+        obs_type = self._obs_type
+        
+        with _global_emulator_lock:
+            # Force garbage collection to clean up any existing emulator instances
+            gc.collect()
+            
+            # Close current environment and global emulator
+            try:
+                if hasattr(self._env, 'close'):
+                    self._env.close()
+            except:
+                pass
+            
+            try:
+                if _global_current_emulator is not None:
+                    _global_current_emulator.close()
+                    _global_current_emulator = None
+            except:
+                pass
+            
+            # Clear the environment reference
+            self._env = None
+            gc.collect()
+            
+            # Recreate environment
+            if RetroEnv is not None:
+                self._env = RetroEnv(
+                    game=game,
+                    state=state,
+                    scenario=scenario,
+                    info=info,
+                    use_restricted_actions=use_restricted_actions,
+                    players=players,
+                    inttype=inttype,
+                    obs_type=obs_type,
+                    render_mode=None,  # Disable rendering to avoid display issues
+                )
+            else:
+                # Fallback to retro.make
+                try:
+                    self._env = retro.make(
+                        game=game,
+                        state=state,
+                        scenario=scenario,
+                        info=info,
+                        use_restricted_actions=use_restricted_actions,
+                        players=players,
+                        inttype=inttype,
+                        obs_type=obs_type,
+                        render_mode=None,  # Disable rendering to avoid display issues
+                    )
+                except TypeError:
+                    # Fallback for older versions without render_mode
+                    self._env = retro.make(
+                        game=game,
+                        state=state,
+                        scenario=scenario,
+                        info=info,
+                        use_restricted_actions=use_restricted_actions,
+                        players=players,
+                        inttype=inttype,
+                        obs_type=obs_type,
+                    )
+            
+            # Update global emulator reference
+            _global_current_emulator = self._env
+            
+            # Verify emulator was created successfully
+            if not hasattr(self._env, 'em') or self._env.em is None:
+                raise RuntimeError("Failed to create emulator instance")
+            
+            # Reset environment
+            self._env.reset()
+            print("Retro environment reinitialized successfully")
+    
     def close(self):
         """Close environment"""
-        return self._env.close()
+        global _global_emulator_lock, _global_current_emulator
+        
+        with _global_emulator_lock:
+            try:
+                if hasattr(self._env, 'close'):
+                    self._env.close()
+                if _global_current_emulator == self._env:
+                    _global_current_emulator = None
+            except:
+                pass
     
     def seed(self, seed=None):
         """Set random seed"""

@@ -194,45 +194,81 @@ def make_env(config, mode, id):
         env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
         env = wrappers.OneHotAction(env)
     elif suite == "retro":
-        import envs.stable_retro as stable_retro
+        # 支持多游戏retro训练
+        if hasattr(config, 'retro_games') and config.retro_games:
+            # 多游戏模式
+            import envs.multigame_retro as multigame_retro
+            
+            games = config.retro_games
+            if isinstance(games, str):
+                games = [game.strip() for game in games.split(',')]
+            
+            env = multigame_retro.MultiGameRetroEnv(
+                games=games,
+                action_repeat=config.action_repeat,
+                size=config.size,
+                grayscale=config.grayscale,
+                seed=config.seed + id,
+                visual_reward=getattr(config, 'visual_reward', False),
+                visual_reward_weight=getattr(config, 'visual_reward_weight', 0.1),
+                visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
+                visual_episode_length=getattr(config, 'visual_episode_length', 1000),
+                visual_device=getattr(config, 'visual_device', 'auto')
+            )
+            
+            # 配置游戏切换策略
+            if hasattr(config, 'game_switch_strategy'):
+                game_switch_freq = getattr(config, 'game_switch_freq', 1000)
+                env.set_game_switch_strategy(config.game_switch_strategy, game_switch_freq)
+                print(f"Game switch strategy: {config.game_switch_strategy} (freq: {game_switch_freq})")
+        else:
+            # 单游戏模式（向后兼容）
+            import envs.stable_retro as stable_retro
 
-        env = stable_retro.StableRetro(
-            game=task,
-            action_repeat=config.action_repeat,
-            size=config.size,
-            grayscale=config.grayscale,
-            seed=config.seed + id,
-        )
-        
-        # Add visual reward wrapper if enabled
-        if getattr(config, 'visual_reward', False) and getattr(config, 'visual_reward_weight', 0.0) > 0.0:
-            try:
-                from envs.visual_reward_wrapper import VisualRewardWrapper
-                
-                visual_device = getattr(config, 'visual_device', 'auto')
-                if visual_device == 'auto':
-                    visual_device = config.device if hasattr(config, 'device') else 'auto'
-                
-                env = VisualRewardWrapper(
-                    env,
-                    visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
-                    visual_reward_weight=getattr(config, 'visual_reward_weight', 0.1),
-                    episode_length=getattr(config, 'visual_episode_length', 1000),
-                    device=visual_device
-                )
-                print(f"Visual reward enabled for retro environment (weight: {config.visual_reward_weight})")
-            except Exception as e:
-                print(f"Warning: Failed to enable visual reward: {e}")
-                print("Continuing without visual reward...")
-        
-        env = wrappers.OneHotAction(env)
+            env = stable_retro.StableRetro(
+                game=task,
+                action_repeat=config.action_repeat,
+                size=config.size,
+                grayscale=config.grayscale,
+                seed=config.seed + id,
+            )
+            
+            # Add visual reward wrapper if enabled
+            if getattr(config, 'visual_reward', False) and getattr(config, 'visual_reward_weight', 0.0) > 0.0:
+                try:
+                    from envs.visual_reward_wrapper import VisualRewardWrapper
+                    
+                    visual_device = getattr(config, 'visual_device', 'auto')
+                    if visual_device == 'auto':
+                        visual_device = config.device if hasattr(config, 'device') else 'auto'
+                    
+                    env = VisualRewardWrapper(
+                        env,
+                        visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
+                        visual_reward_weight=getattr(config, 'visual_reward_weight', 0.1),
+                        episode_length=getattr(config, 'visual_episode_length', 1000),
+                        device=visual_device
+                    )
+                    print(f"Visual reward enabled for retro environment (weight: {config.visual_reward_weight})")
+                except Exception as e:
+                    print(f"Warning: Failed to enable visual reward: {e}")
+                    print("Continuing without visual reward...")
+            
+            env = wrappers.OneHotAction(env)
     else:
         raise NotImplementedError(suite)
-    env = wrappers.TimeLimit(env, config.time_limit)
-    env = wrappers.SelectAction(env, key="action")
-    env = wrappers.UUID(env)
-    if suite == "minecraft":
-        env = wrappers.RewardObs(env)
+    # 多游戏环境不需要某些包装器
+    if suite == "retro" and hasattr(config, 'retro_games') and config.retro_games:
+        # 多游戏retro环境已经有自己的包装器
+        env = wrappers.TimeLimit(env, config.time_limit)
+        env = wrappers.SelectAction(env, key="action")
+        env = wrappers.UUID(env)
+    else:
+        env = wrappers.TimeLimit(env, config.time_limit)
+        env = wrappers.SelectAction(env, key="action")
+        env = wrappers.UUID(env)
+        if suite == "minecraft":
+            env = wrappers.RewardObs(env)
     return env
 
 
@@ -272,11 +308,17 @@ def main(config):
     # Special handling for retro environments due to single emulator limitation
     suite, task = config.task.split("_", 1)
     if suite == "retro":
-        # For retro, create only one environment and reuse for both train and eval
-        print("Warning: Using single environment for both train and eval due to retro emulator limitation")
-        shared_env = make("train", 0)
-        train_envs = [shared_env]
-        eval_envs = [shared_env]  # Reuse the same environment
+        if hasattr(config, 'retro_games') and config.retro_games:
+            # 多游戏模式：每个游戏独立环境
+            print(f"Creating multi-game retro environment with games: {config.retro_games}")
+            train_envs = [make("train", 0)]  # 多游戏环境管理器
+            eval_envs = [make("eval", 0)]    # 多游戏环境管理器
+        else:
+            # 单游戏模式：由于模拟器限制，只能创建一个环境
+            print("Warning: Using single environment for both train and eval due to retro emulator limitation")
+            shared_env = make("train", 0)
+            train_envs = [shared_env]
+            eval_envs = [shared_env]  # Reuse the same environment
     else:
         train_envs = [make("train", i) for i in range(config.envs)]
         eval_envs = [make("eval", i) for i in range(config.envs)]
@@ -289,13 +331,25 @@ def main(config):
         eval_envs = [Damy(env) for env in eval_envs]
     acts = train_envs[0].action_space
     print("Action Space", acts)
-    config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+    
+    # 多游戏模式的特殊处理
+    if suite == "retro" and hasattr(config, 'retro_games') and config.retro_games:
+        # 多游戏模式：使用最大动作数
+        if hasattr(train_envs[0], 'max_num_actions'):
+            config.num_actions = train_envs[0].max_num_actions
+            config.game_action_spaces = train_envs[0].num_actions_list
+            print(f"Multi-game action spaces: {config.game_action_spaces}")
+            print(f"Using max actions: {config.num_actions}")
+        else:
+            config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+    else:
+        config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
 
     state = None
     if not config.offline_traindir:
         prefill = max(0, config.prefill - count_steps(config.traindir))
         print(f"Prefill dataset ({prefill} steps).")
-        if hasattr(acts, "discrete"):
+        if hasattr(acts, "n"):
             random_actor = tools.OneHotDist(
                 torch.zeros(config.num_actions).repeat(config.envs, 1)
             )
@@ -328,13 +382,27 @@ def main(config):
     print("Simulate agent.")
     train_dataset = make_dataset(train_eps, config)
     eval_dataset = make_dataset(eval_eps, config)
-    agent = Dreamer(
-        train_envs[0].observation_space,
-        train_envs[0].action_space,
-        config,
-        logger,
-        train_dataset,
-    ).to(config.device)
+    
+    # 根据是否多游戏模式选择不同的Agent
+    if suite == "retro" and hasattr(config, 'retro_games') and config.retro_games:
+        from multigame_dreamer import MultiGameDreamer
+        agent = MultiGameDreamer(
+            train_envs[0].observation_space,
+            train_envs[0].action_space,
+            config,
+            logger,
+            train_dataset,
+        ).to(config.device)
+        print("Created Multi-Game Dreamer Agent")
+    else:
+        agent = Dreamer(
+            train_envs[0].observation_space,
+            train_envs[0].action_space,
+            config,
+            logger,
+            train_dataset,
+        ).to(config.device)
+        print("Created Single-Game Dreamer Agent")
     agent.requires_grad_(requires_grad=False)
     if (logdir / "latest.pt").exists():
         checkpoint = torch.load(logdir / "latest.pt")
