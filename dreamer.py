@@ -273,18 +273,6 @@ def make_env(config, mode, id):
 
 
 def main(config):
-    # 检查是否启用多GPU训练
-    use_multi_gpu = getattr(config, 'multi_gpu', False) and torch.cuda.device_count() > 1
-    
-    if use_multi_gpu:
-        print(f"Multi-GPU training enabled: {torch.cuda.device_count()} GPUs available")
-        from multigpu_trainer import launch_multi_gpu_training
-        
-        # 启动多GPU训练
-        launch_multi_gpu_training(config, None)
-        return
-    
-    # 单GPU训练逻辑（保持原有逻辑）
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()

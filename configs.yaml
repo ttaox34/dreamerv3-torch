@@ -18,11 +18,6 @@ defaults:
   precision: 32
   debug: False
   video_pred_log: True
-  
-  # Multi-GPU training
-  multi_gpu: False              # Enable multi-GPU training
-  multi_gpu_backend: 'nccl'     # Backend for distributed training
-  multi_gpu_find_unused_parameters: True  # For DDP
 
   # Environment
   task: 'dmc_walker_walk'
@@ -234,52 +229,6 @@ retro_multigame:
   game_switch_strategy: 'random'    # Options: 'random', 'round_robin', 'episode_based', 'none'
   game_switch_freq: 1               # Switch every N episodes (for episode_based strategy)
   visual_device: 'auto'         # Device for visual encoder: auto, cpu, cuda, cuda:0, etc.
-
-# Multi-GPU configurations
-multigpu_dmc_vision:
-  task: 'dmc_walker_walk'
-  steps: 1e6
-  action_repeat: 2
-  envs: 8                     # Total environments across all GPUs
-  train_ratio: 512
-  video_pred_log: true
-  encoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  decoder: {mlp_keys: '$^', cnn_keys: 'image'}
-  multi_gpu: True             # Enable multi-GPU training
-  multi_gpu_backend: 'nccl'
-  batch_size: 32              # Increased batch size for multi-GPU
-  batch_length: 64
-
-multigpu_retro:
-  steps: 4e5
-  envs: 4                     # Total environments across all GPUs
-  action_repeat: 4
-  train_ratio: 1024
-  video_pred_log: true
-  eval_episode_num: 5
-  actor: {dist: 'onehot', std: 'none'}
-  imag_gradient: 'reinforce'
-  grayscale: False
-  time_limit: 108000
-  size: [64, 64]
-  multi_gpu: True             # Enable multi-GPU training
-  multi_gpu_backend: 'nccl'
-  batch_size: 32              # Increased batch size for multi-GPU
-  batch_length: 64
-  
-  # Multi-game parameters
-  retro_games: "BalloonFight-Nes,BomberRaid-Sms"  # Comma-separated list of games
-  
-  # Visual reward parameters
-  visual_reward: True
-  visual_encoder: 'CLIP'
-  visual_reward_weight: 0.1
-  visual_episode_length: 1000
-  
-  # Game switching strategy
-  game_switch_strategy: 'random'
-  game_switch_freq: 1
-  visual_device: 'auto'
 
 debug:
   debug: True
