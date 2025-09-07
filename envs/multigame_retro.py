@@ -10,6 +10,7 @@ import torch
 from collections import defaultdict
 import threading
 import time
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 from .stable_retro import StableRetro
@@ -90,6 +91,12 @@ class MultiGameRetroEnv(gym.Env):
         self.game_switch_freq = 1000
         self.episode_count = 0
         
+        # Step计数器
+        self.current_step = 0
+        self.total_steps = 0
+        self.last_output_step = 0
+        self.output_freq = 1000  # 每1000步输出一次
+        
     def _create_envs(self):
         """为每个游戏创建环境"""
         print(f"Creating environments for games: {self.games}")
@@ -126,14 +133,23 @@ class MultiGameRetroEnv(gym.Env):
                 
                 # 获取动作空间信息
                 action_space = temp_env.action_space
+                
+                # 根据动作空间类型计算动作数
                 if hasattr(action_space, 'n'):
-                    num_actions = action_space.n
+                    # MultiBinary space
+                    n_buttons = action_space.n
+                    num_actions = 2 ** n_buttons
+                    space_type = "MultiBinary"
                 else:
-                    num_actions = action_space.shape[0] if hasattr(action_space, 'shape') else 1
+                    # Discrete space
+                    num_actions = action_space.n
+                    space_type = "Discrete"
                 
                 self.action_spaces.append(action_space)
                 self.num_actions_list.append(num_actions)
                 self.max_num_actions = max(self.max_num_actions, num_actions)
+                
+                print(f"{game}: {space_type} space, {n_buttons if hasattr(action_space, 'n') else '1'} buttons, {num_actions} possible actions")
                 
                 # 关闭临时环境
                 temp_env.close()
@@ -260,7 +276,13 @@ class MultiGameRetroEnv(gym.Env):
         
         # 打印游戏切换信息
         if old_game_idx != self.current_game_idx:
-            print(f"Switching from game {self.games[old_game_idx]} to game {self.games[self.current_game_idx]} (episode {self.episode_count})")
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] Switching from game {self.games[old_game_idx]} to game {self.games[self.current_game_idx]} (episode {self.episode_count})")
+        
+        # 重置当前episode的step计数器
+        self.current_step = 0
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] Starting episode {self.episode_count} in {self.games[self.current_game_idx]} (Total steps: {self.total_steps})")
         
         # 获取或创建环境
         env = self._get_or_create_env(self.current_game_idx)
@@ -307,6 +329,15 @@ class MultiGameRetroEnv(gym.Env):
         # 执行动作
         step_result = env.step(action)
         
+        # 更新step计数器
+        self.current_step += 1
+        self.total_steps += 1
+        
+        # 定期输出当前状态
+        if self.total_steps - self.last_output_step >= self.output_freq:
+            self._output_progress()
+            self.last_output_step = self.total_steps
+        
         # 处理不同的gym API返回格式
         if len(step_result) == 5:
             # 新的gym API: (obs, reward, terminated, truncated, info)
@@ -352,6 +383,21 @@ class MultiGameRetroEnv(gym.Env):
             self.game_switch_freq = freq
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+    
+    def set_output_frequency(self, freq: int):
+        """设置输出频率
+        
+        Args:
+            freq: 每N步输出一次进度信息
+        """
+        self.output_freq = freq
+    
+    def _output_progress(self):
+        """输出当前进度信息"""
+        current_game = self.games[self.current_game_idx]
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] [Progress] Episode: {self.episode_count}, Step: {self.current_step}, "
+              f"Total Steps: {self.total_steps}, Current Game: {current_game}")
     
     def get_valid_actions(self, game_idx: Optional[int] = None) -> List[int]:
         """获取指定游戏的有效动作列表"""

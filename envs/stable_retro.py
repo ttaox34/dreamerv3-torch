@@ -153,24 +153,18 @@ class StableRetro(gym.Env):
     
     def _setup_spaces(self):
         """Setup observation and action spaces"""
-        # Action space - always convert to Discrete for DreamerV3 compatibility
-        if hasattr(self._env.action_space, 'n'):
-            # MultiBinary space
-            n_buttons = self._env.action_space.n
-            # Create discrete space with 2^n_buttons possible combinations
-            # But limit to reasonable number to avoid memory issues
-            if n_buttons <= 10:  # Max 1024 combinations
-                n_actions = 2 ** n_buttons
-            else:
-                # For too many buttons, use filtered actions if available
-                n_actions = min(2 ** n_buttons, 512)  # Cap at 512 actions
-            
-            self.action_space = gym.spaces.Discrete(n_actions)
-            self._n_buttons = n_buttons
-            self._is_multibinary = True
+        # Action space - preserve original space information
+        self.action_space = self._env.action_space
+        self._is_multibinary = hasattr(self._env.action_space, 'n')
+        
+        if self._is_multibinary:
+            # For MultiBinary space, store button count and max possible actions
+            self._n_buttons = self._env.action_space.n
+            self._n_actions = 2 ** self._n_buttons
         else:
-            self.action_space = self._env.action_space
-            self._is_multibinary = False
+            # For Discrete space
+            self._n_buttons = 1
+            self._n_actions = self._env.action_space.n
         
         # Observation space - return as dict for DreamerV3 compatibility
         if self._obs_type == retro.Observations.IMAGE:

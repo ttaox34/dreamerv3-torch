@@ -57,9 +57,19 @@ class MultiHeadImagBehavior(nn.Module):
         self.game_to_idx = {game: idx for idx, game in enumerate(game_action_spaces.keys())}
         
         for game_name, num_actions in game_action_spaces.items():
+            # 对于MultiBinary动作空间，我们输出每个按钮的概率
+            # 而不是所有可能的动作组合
+            if num_actions > 512:  # 很可能是MultiBinary空间
+                # 输出每个按钮的概率
+                n_buttons = int(np.log2(num_actions))
+                output_shape = (n_buttons,)
+            else:
+                # 普通的Discrete空间
+                output_shape = (num_actions,)
+            
             self.actor_heads[game_name] = networks.MLP(
                 config.units,  # 输入是共享层的输出
-                (num_actions,),
+                output_shape,
                 config.actor["layers"],
                 config.units,
                 config.act,
@@ -399,13 +409,36 @@ class MultiGameImagBehavior(nn.Module):
                     action = action_dist.mode()
                     logprob = action_dist.log_prob(action)
                 
-                # 对于onehot分布，将one-hot向量转换为标量动作
-                if action.dim() > 1:
-                    action = torch.argmax(action, dim=-1)
-                
-                # 确保logprob是标量张量
-                if logprob.dim() > 0:
-                    logprob = logprob.squeeze(-1)
+                # 处理不同类型的动作分布
+                if isinstance(action_dist, torch.distributions.Independent):
+                    # MultiBinary动作空间：将按钮状态转换为动作索引
+                    button_probs = action_dist.base_dist.probs
+                    if sample:
+                        # 采样每个按钮的状态
+                        button_actions = torch.bernoulli(button_probs)
+                    else:
+                        # 使用每个按钮的最大概率
+                        button_actions = (button_probs > 0.5).float()
+                    
+                    # 将二进制按钮状态转换为动作索引
+                    action_indices = []
+                    for i in range(button_actions.shape[0]):
+                        action_idx = 0
+                        for j in range(button_actions.shape[-1]):
+                            action_idx += int(button_actions[i, j].item()) * (2 ** j)
+                        action_indices.append(action_idx)
+                    
+                    action = torch.tensor(action_indices, device=feat.device, dtype=torch.long)
+                    # 近似计算logprob
+                    logprob = action_dist.log_prob(button_actions).sum(dim=-1)
+                else:
+                    # 普通的onehot分布，将one-hot向量转换为标量动作
+                    if action.dim() > 1:
+                        action = torch.argmax(action, dim=-1)
+                    
+                    # 确保logprob是标量张量
+                    if logprob.dim() > 0:
+                        logprob = logprob.squeeze(-1)
                 
                 actions[mask] = action
                 logprobs[mask] = logprob

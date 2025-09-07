@@ -221,6 +221,11 @@ def make_env(config, mode, id):
                 game_switch_freq = getattr(config, 'game_switch_freq', 1000)
                 env.set_game_switch_strategy(config.game_switch_strategy, game_switch_freq)
                 print(f"Game switch strategy: {config.game_switch_strategy} (freq: {game_switch_freq})")
+            
+            # 配置输出频率
+            if hasattr(config, 'progress_output_freq'):
+                env.set_output_frequency(config.progress_output_freq)
+                print(f"Progress output frequency: every {config.progress_output_freq} steps")
         else:
             # 单游戏模式（向后兼容）
             import envs.stable_retro as stable_retro
