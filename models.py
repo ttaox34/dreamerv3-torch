@@ -58,7 +58,7 @@ class WorldModel(nn.Module):
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
         self.heads["decoder"] = networks.MultiDecoder(
-            feat_size, shapes, **config.decoder
+            feat_size, shapes, device=config.device, **config.decoder
         )
         self.heads["reward"] = networks.MLP(
             feat_size,

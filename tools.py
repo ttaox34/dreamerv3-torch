@@ -187,7 +187,15 @@ def simulate(
         length *= 1 - done
         # add to cache
         for a, result, env in zip(action, results, envs):
-            o, r, d, info = result
+            # Handle both 4-value and 5-value returns from environments
+            if len(result) == 5:
+                # New gymnasium API: (obs, reward, terminated, truncated, info)
+                o, r, terminated, truncated, info = result
+                d = terminated or truncated  # Convert to single done flag
+            else:
+                # Old gym API: (obs, reward, done, info)
+                o, r, d, info = result
+            
             o = {k: convert(v) for k, v in o.items()}
             transition = o.copy()
             if isinstance(a, dict):

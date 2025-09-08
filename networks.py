@@ -325,8 +325,15 @@ class MultiEncoder(nn.Module):
 
         self.outdim = 0
         if self.cnn_shapes:
-            input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
-            input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
+            input_ch = sum([v[0] for v in self.cnn_shapes.values()])
+            # Get first shape and convert from (C, H, W) to (H, W, C)
+            first_shape = tuple(self.cnn_shapes.values())[0]
+            if len(first_shape) == 3:
+                # Shape is (C, H, W), convert to (H, W, total_C)
+                input_shape = (first_shape[1], first_shape[2], input_ch)
+            else:
+                # Fallback for other formats
+                input_shape = first_shape[:2] + (input_ch,)
             self._cnn = ConvEncoder(
                 input_shape, cnn_depth, act, norm, kernel_size, minres
             )
@@ -375,6 +382,7 @@ class MultiDecoder(nn.Module):
         image_dist,
         vector_dist,
         outscale,
+        device="cuda",
     ):
         super(MultiDecoder, self).__init__()
         excluded = ("is_first", "is_last", "is_terminal")
@@ -403,6 +411,7 @@ class MultiDecoder(nn.Module):
                 minres,
                 outscale=outscale,
                 cnn_sigmoid=cnn_sigmoid,
+                device=device,
             )
         if self.mlp_shapes:
             self._mlp = MLP(
@@ -414,6 +423,7 @@ class MultiDecoder(nn.Module):
                 norm,
                 vector_dist,
                 outscale=outscale,
+                device=device,
                 name="Decoder",
             )
         self._image_dist = image_dist
@@ -487,16 +497,27 @@ class ConvEncoder(nn.Module):
         self.layers.apply(tools.weight_init)
 
     def forward(self, obs):
-        obs -= 0.5
-        # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
-        x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
-        # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
-        x = x.permute(0, 3, 1, 2)
-        x = self.layers(x)
-        # (batch * time, ...) -> (batch * time, -1)
-        x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
-        # (batch * time, -1) -> (batch, time, -1)
-        return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
+        # Check input format and handle accordingly
+        if len(obs.shape) == 4:
+            # Input is (batch, ch, h, w) - standard PyTorch format
+            obs -= 0.5
+            x = obs  # Already in correct format for conv layers
+            x = self.layers(x)
+            # (batch, ch, h, w) -> (batch, -1)
+            x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+            return x
+        else:
+            # Input is (batch, time, h, w, ch) - original Dreamer format
+            obs -= 0.5
+            # (batch, time, h, w, ch) -> (batch * time, h, w, ch)
+            x = obs.reshape((-1,) + tuple(obs.shape[-3:]))
+            # (batch * time, h, w, ch) -> (batch * time, ch, h, w)
+            x = x.permute(0, 3, 1, 2)
+            x = self.layers(x)
+            # (batch * time, ...) -> (batch * time, -1)
+            x = x.reshape([x.shape[0], np.prod(x.shape[1:])])
+            # (batch * time, -1) -> (batch, time, -1)
+            return x.reshape(list(obs.shape[:-3]) + [x.shape[-1]])
 
 
 class ConvDecoder(nn.Module):
@@ -505,15 +526,20 @@ class ConvDecoder(nn.Module):
         feat_size,
         shape=(3, 64, 64),
         depth=32,
-        act=nn.ELU,
+        act='ELU',
         norm=True,
         kernel_size=4,
         minres=4,
         outscale=1.0,
         cnn_sigmoid=False,
+        device="cuda",
     ):
         super(ConvDecoder, self).__init__()
-        act = getattr(torch.nn, act)
+        if isinstance(act, str):
+            act = getattr(torch.nn, act)
+        elif act is None:
+            act = torch.nn.ELU
+        self._device = device
         self._shape = shape
         self._cnn_sigmoid = cnn_sigmoid
         layer_num = int(np.log2(shape[1]) - np.log2(minres))
@@ -521,7 +547,8 @@ class ConvDecoder(nn.Module):
         out_ch = minres**2 * depth * 2 ** (layer_num - 1)
         self._embed_size = out_ch
 
-        self._linear_layer = nn.Linear(feat_size, out_ch)
+        self._linear_layer = nn.Linear(int(feat_size), int(out_ch))
+        self._linear_layer.to(device)
         self._linear_layer.apply(tools.uniform_weight_init(outscale))
         in_dim = out_ch // (minres**2)
         out_dim = in_dim // 2
@@ -558,8 +585,9 @@ class ConvDecoder(nn.Module):
             in_dim = out_dim
             out_dim //= 2
             h, w = h * 2, w * 2
-        [m.apply(tools.weight_init) for m in layers[:-1]]
-        layers[-1].apply(tools.uniform_weight_init(outscale))
+        if len(layers) > 0:
+            [m.apply(tools.weight_init) for m in layers[:-1]]
+            layers[-1].apply(tools.uniform_weight_init(outscale))
         self.layers = nn.Sequential(*layers)
 
     def calc_same_pad(self, k, s, d):

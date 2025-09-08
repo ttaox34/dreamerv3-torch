@@ -21,18 +21,19 @@ class TimeLimit(gym.Wrapper):
         if len(step_result) == 5:
             # New gym API
             obs, reward, terminated, truncated, info = step_result
-            done = terminated or truncated
         else:
             # Old gym API
             obs, reward, done, info = step_result
+            terminated = done
+            truncated = False
         
         self._step += 1
         if self._step >= self._duration:
-            done = True
+            terminated = True
             if "discount" not in info:
                 info["discount"] = np.array(1.0).astype(np.float32)
             self._step = None
-        return obs, reward, done, info
+        return obs, reward, terminated, truncated, info
 
     def reset(self, **kwargs):
         self._step = 0

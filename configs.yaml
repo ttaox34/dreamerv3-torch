@@ -185,7 +185,7 @@ memorymaze:
 
 retro:
   steps: 4e5
-  envs: 1                       # Must be 1 for stable-retro (limitation)
+  envs: 1                       # Will be automatically set to number of games in parallel mode
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
@@ -196,12 +196,40 @@ retro:
   time_limit: 108000
   size: [64, 64]               # Changed from 84x84 to 64x64 for ConvDecoder compatibility
   
+  # Parallel multi-game support
+  retro_parallel_games: False   # Enable parallel training across multiple games
+  retro_games_list: []          # List of games for parallel training (empty = single game mode)
+  
   # Visual reward parameters
   visual_reward: True           # Enable visual reward
   visual_encoder: 'CLIP'      # Options: CLIP, ResNet, ViT, DINO (ResNet is most stable)
   visual_reward_weight: 0.1     # Weight for visual reward (0.0 = disabled)
   visual_episode_length: 1000   # Episode length for visual reward clustering
   visual_device: 'auto'         # Device for visual encoder: auto, cpu, cuda, cuda:0, etc.
+
+retro_parallel:
+  steps: 2e6                    # Longer training for multi-game
+  envs: 1                       # Will be set automatically
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 10
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  grayscale: False
+  time_limit: 108000
+  size: [64, 64]
+  
+  # Enable parallel multi-game training
+  retro_parallel_games: True
+  retro_games_list: ["Battletoads-Nes", "NinjaGaidenIITheDarkSwordOfChaos-Nes", "MetalStorm-Nes"]
+  
+  # Visual reward settings for multi-game
+  visual_reward: True
+  visual_encoder: 'ResNet'      # ResNet might be more stable for multi-game
+  visual_reward_weight: 0.05    # Lower weight for multi-game stability
+  visual_episode_length: 1000
+  visual_device: 'auto'
 
 debug:
   debug: True
