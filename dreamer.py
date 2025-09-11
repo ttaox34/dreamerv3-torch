@@ -25,6 +25,7 @@ from torch import distributions as torchd
 to_np = lambda x: x.detach().cpu().numpy()
 
 
+
 class Dreamer(nn.Module):
     def __init__(self, obs_space, act_space, config, logger, dataset):
         super(Dreamer, self).__init__()
@@ -37,18 +38,15 @@ class Dreamer(nn.Module):
         self._should_reset = tools.Every(config.reset_every)
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
         self._metrics = {}
-        # this is update step
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
-        if (
-            config.compile and os.name != "nt"
-        ):  # compilation is not supported on windows
+        if config.compile and os.name != "nt":
             self._wm = torch.compile(self._wm)
             self._task_behavior = torch.compile(self._task_behavior)
-        reward = lambda f, s, a: self._wm.heads["reward"](f).mean()
+        reward = lambda f, s, a: self._wm.heads["reward"](self._wm.get_feat(s)).mean()
         self._expl_behavior = dict(
             greedy=lambda: self._task_behavior,
             random=lambda: expl.Random(config, act_space),
@@ -71,7 +69,7 @@ class Dreamer(nn.Module):
                 for name, values in self._metrics.items():
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
-                if self._config.video_pred_log:
+                if self._config.video_pred_log and not isinstance(self._wm, models.VJEPAWorldModel):
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
@@ -89,11 +87,18 @@ class Dreamer(nn.Module):
         else:
             latent, action = state
         obs = self._wm.preprocess(obs)
-        embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
-        if self._config.eval_state_mean:
-            latent["stoch"] = latent["mean"]
-        feat = self._wm.dynamics.get_feat(latent)
+        
+        if isinstance(self._wm, models.VJEPAWorldModel):
+            embed = self._wm.encode(obs)
+            latent = self._wm.obs_step(latent, action, embed, obs["is_first"])
+            feat = self._wm.get_feat(latent)
+        else: # Original RSSM logic
+            embed = self._wm.encoder(obs)
+            latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+            if self._config.eval_state_mean:
+                latent["stoch"] = latent["mean"]
+            feat = self._wm.dynamics.get_feat(latent)
+
         if not training:
             actor = self._task_behavior.actor(feat)
             action = actor.mode()
@@ -104,14 +109,20 @@ class Dreamer(nn.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
         logprob = actor.log_prob(action)
-        latent = {k: v.detach() for k, v in latent.items()}
-        action = action.detach()
+        
+        if isinstance(self._wm, models.VJEPAWorldModel):
+            state = (latent.detach(), action.detach())
+        else:
+            latent = {k: v.detach() for k, v in latent.items()}
+            action = action.detach()
+
         if self._config.actor["dist"] == "onehot_gumble":
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
         policy_output = {"action": action, "logprob": logprob}
-        state = (latent, action)
+        if not isinstance(self._wm, models.VJEPAWorldModel):
+            state = (latent, action)
         return policy_output, state
 
     def _train(self, data):
@@ -120,17 +131,23 @@ class Dreamer(nn.Module):
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
-            self._wm.dynamics.get_feat(s)
+            self._wm.get_feat(s)
         ).mode()
         metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train(start, context, data)[-1]
-            metrics.update({"expl_" + key: value for key, value in mets.items()})
+            if isinstance(self._wm, models.VJEPAWorldModel):
+                # Plan2Explore not yet compatible with VJEPAWorldModel
+                pass
+            else:
+                mets = self._expl_behavior.train(start, context, data)[-1]
+                metrics.update({"expl_" + key: value for key, value in mets.items()})
         for name, value in metrics.items():
             if not name in self._metrics.keys():
                 self._metrics[name] = [value]
             else:
                 self._metrics[name].append(value)
+
+
 
 
 def count_steps(folder):

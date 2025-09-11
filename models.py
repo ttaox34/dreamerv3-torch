@@ -26,9 +26,11 @@ class RewardEMA:
         return offset.detach(), scale.detach()
 
 
-class WorldModel(nn.Module):
+from vjepa_models import VJEPAWorldModel as WorldModel
+
+class RSSMWorldModel(nn.Module):
     def __init__(self, obs_space, act_space, step, config):
-        super(WorldModel, self).__init__()
+        super(RSSMWorldModel, self).__init__()
         self._step = step
         self._use_amp = True if config.precision == 16 else False
         self._config = config
@@ -218,10 +220,13 @@ class ImagBehavior(nn.Module):
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
-        if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
-        else:
-            feat_size = config.dyn_stoch + config.dyn_deter
+        if isinstance(world_model, WorldModel): # VJEPAWorldModel
+            feat_size = 1408
+        else: # Original RSSMWorldModel
+            if config.dyn_discrete:
+                feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            else:
+                feat_size = config.dyn_stoch + config.dyn_deter
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -299,7 +304,9 @@ class ImagBehavior(nn.Module):
                 )
                 reward = objective(imag_feat, imag_state, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
-                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+                
+                # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # VJEPA state is not a distribution
+                
                 # this target is not scaled by ema or sym_log.
                 target, weights, base = self._compute_target(
                     imag_feat, imag_state, reward
@@ -346,28 +353,44 @@ class ImagBehavior(nn.Module):
         return imag_feat, imag_state, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):
-        dynamics = self._world_model.dynamics
-        flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-        start = {k: flatten(v) for k, v in start.items()}
+        if isinstance(self._world_model, WorldModel): # VJEPAWorldModel
+            flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+            start_z = flatten(start)
 
-        def step(prev, _):
-            state, _, _ = prev
-            feat = dynamics.get_feat(state)
-            inp = feat.detach()
-            action = policy(inp).sample()
-            succ = dynamics.img_step(state, action)
-            return succ, feat, action
+            def step(prev_z, _):
+                inp = prev_z.detach()
+                action = policy(inp).sample()
+                next_z = self._world_model.imagine_step(prev_z, action)
+                return next_z, action
+            
+            zs, actions = tools.static_scan(step, [torch.arange(horizon)], (start_z, None))
+            zs = torch.cat([start_z[None], zs], 0)
+            # For VJEPA model, the feature and state are the same tensor z
+            return zs, zs, actions
+        else: # Original RSSM logic
+            dynamics = self._world_model.dynamics
+            flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
+            start = {k: flatten(v) for k, v in start.items()}
 
-        succ, feats, actions = tools.static_scan(
-            step, [torch.arange(horizon)], (start, None, None)
-        )
-        states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+            def step(prev, _):
+                state, _, _ = prev
+                feat = dynamics.get_feat(state)
+                inp = feat.detach()
+                action = policy(inp).sample()
+                succ = dynamics.img_step(state, action)
+                return succ, feat, action
 
-        return feats, states, actions
+            succ, feats, actions = tools.static_scan(
+                step, [torch.arange(horizon)], (start, None, None)
+            )
+            states = {k: torch.cat([start[k][None], v[:-1]], 0) for k, v in succ.items()}
+
+            return feats, states, actions
 
     def _compute_target(self, imag_feat, imag_state, reward):
         if "cont" in self._world_model.heads:
-            inp = self._world_model.dynamics.get_feat(imag_state)
+            # For VJEPA, imag_state is the latent tensor z
+            inp = self._world_model.get_feat(imag_state)
             discount = self._config.discount * self._world_model.heads["cont"](inp).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)

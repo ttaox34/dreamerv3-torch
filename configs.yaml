@@ -189,7 +189,7 @@ retro:
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
-  eval_episode_num: 10
+  eval_episode_num: 1
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   grayscale: False
@@ -209,3 +209,23 @@ debug:
   prefill: 1
   batch_size: 10
   batch_length: 20
+
+vjepa_retro:
+  task: 'retro_SuperMarioBros-Nes' # Example, can be changed
+  steps: 1e6
+  action_repeat: 4
+  time_limit: 108000
+  eval_episode_num: 1
+  eval_every: 1e4
+  log_every: 1e4
+  train_ratio: 512
+  prefill: 2500
+  # VJEPA specific configs
+  size: [256, 256] # VJEPA was trained on larger images
+  video_pred_log: False # VJEPA does not have a decoder for video prediction
+  grad_heads: ['reward', 'cont'] # No decoder head to train
+  vjepa_encoder_path: '/data/mingyu/dreamerv3-torch/vjepa2/vitg.pt'
+  vjepa_ac_path: '/data/mingyu/dreamerv3-torch/vjepa2/vjepa2-ac-vitg.pt'
+  freeze_vjepa_encoder: True
+  freeze_vjepa_predictor: True
+
