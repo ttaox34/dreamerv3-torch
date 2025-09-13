@@ -16,6 +16,7 @@ import models
 import tools
 import envs.wrappers as wrappers
 from parallel import Parallel, Damy
+from vjepa_models import VJEPAWorldModel
 
 import torch
 from torch import nn
@@ -69,7 +70,7 @@ class Dreamer(nn.Module):
                 for name, values in self._metrics.items():
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
-                if self._config.video_pred_log and not isinstance(self._wm, models.VJEPAWorldModel):
+                if self._config.video_pred_log and not hasattr(self._wm, 'vjepa_encoder'):
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
@@ -88,7 +89,7 @@ class Dreamer(nn.Module):
             latent, action = state
         obs = self._wm.preprocess(obs)
         
-        if isinstance(self._wm, models.VJEPAWorldModel):
+        if hasattr(self._wm, 'vjepa_encoder'):
             embed = self._wm.encode(obs)
             latent = self._wm.obs_step(latent, action, embed, obs["is_first"])
             feat = self._wm.get_feat(latent)
@@ -110,7 +111,7 @@ class Dreamer(nn.Module):
             action = actor.sample()
         logprob = actor.log_prob(action)
         
-        if isinstance(self._wm, models.VJEPAWorldModel):
+        if hasattr(self._wm, 'vjepa_encoder'):
             state = (latent.detach(), action.detach())
         else:
             latent = {k: v.detach() for k, v in latent.items()}
@@ -121,7 +122,7 @@ class Dreamer(nn.Module):
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
         policy_output = {"action": action, "logprob": logprob}
-        if not isinstance(self._wm, models.VJEPAWorldModel):
+        if not hasattr(self._wm, 'vjepa_encoder'):
             state = (latent, action)
         return policy_output, state
 
@@ -135,7 +136,7 @@ class Dreamer(nn.Module):
         ).mode()
         metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
-            if isinstance(self._wm, models.VJEPAWorldModel):
+            if hasattr(self._wm, 'vjepa_encoder'):
                 # Plan2Explore not yet compatible with VJEPAWorldModel
                 pass
             else:

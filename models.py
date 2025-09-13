@@ -299,17 +299,18 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                imag_feat, imag_state, imag_action = self._imagine(
+                imag_feat_patches, imag_state_patches, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
-                reward = objective(imag_feat, imag_state, imag_action)
+                imag_feat = self._world_model.get_feat(imag_feat_patches)
+                reward = objective(imag_feat_patches, imag_state_patches, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
                 
                 # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # VJEPA state is not a distribution
                 
                 # this target is not scaled by ema or sym_log.
                 target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward
+                    imag_feat, imag_state_patches, reward
                 )
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
@@ -350,23 +351,31 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self):
             metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
             metrics.update(self._value_opt(value_loss, self.value.parameters()))
-        return imag_feat, imag_state, imag_action, weights, metrics
+        return imag_feat, imag_state_patches, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):
-        if isinstance(self._world_model, WorldModel): # VJEPAWorldModel
-            flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
-            start_z = flatten(start)
+        if hasattr(self._world_model, 'vjepa_encoder'): # VJEPAWorldModel
+            start_z_patches = start['patches'] # Get initial patches
 
-            def step(prev_z, _):
-                inp = prev_z.detach()
+            def step(prev, _):
+                prev_z_patches, _ = prev
+                
+                # Aggregate for policy
+                inp = self._world_model.get_feat(prev_z_patches)
                 action = policy(inp).sample()
-                next_z = self._world_model.imagine_step(prev_z, action)
-                return next_z, action
+
+                # Predict next patches from previous patches
+                next_z_patches = self._world_model.imagine_step(prev_z_patches, action)
+                return (next_z_patches, action)
             
-            zs, actions = tools.static_scan(step, [torch.arange(horizon)], (start_z, None))
-            zs = torch.cat([start_z[None], zs], 0)
-            # For VJEPA model, the feature and state are the same tensor z
-            return zs, zs, actions
+            z_patches_traj, actions = tools.static_scan(step, [torch.arange(horizon)], (start_z_patches, None))
+            z_patches_traj = torch.cat([start_z_patches[None], z_patches_traj], 0)
+
+            # Prepend a placeholder action for the start state to match lengths
+            start_action = torch.zeros_like(actions[0])
+            actions = torch.cat([start_action[None], actions], 0)
+
+            return z_patches_traj, z_patches_traj, actions
         else: # Original RSSM logic
             dynamics = self._world_model.dynamics
             flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))

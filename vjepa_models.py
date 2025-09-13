@@ -117,8 +117,12 @@ class VJEPAWorldModel(nn.Module):
     def _load_ac_predictor(self, path, freeze):
         print(f"Loading V-JEPA AC predictor from {path}")
         predictor = vit_ac_predictor(
+            img_size=self._config.size,
+            patch_size=16,
+            num_frames=self._config.batch_length,
             embed_dim=1408, predictor_embed_dim=1024, depth=24, num_heads=16,
-            use_rope=True, action_embed_dim=self._action_size)
+            use_rope=True, action_embed_dim=self._action_size,
+            use_activation_checkpointing=False) # Disable checkpointing
         
         if path and Path(path).exists():
             try:
@@ -150,29 +154,58 @@ class VJEPAWorldModel(nn.Module):
 
     def _train(self, data):
         data = self.preprocess(data)
+
+        # Encode observations with the frozen encoder without tracking gradients.
+        with torch.no_grad():
+            with torch.cuda.amp.autocast(self._use_amp):
+                z_patches = self.encode(data)
+
+        # Now, with gradients enabled only for the trainable parts, compute losses.
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
-                # Encode observations
-                z = self.encode(data)
-                
-                # Prepare actions for predictor (one-hot encoding)
-                actions_onehot = F.one_hot(data['action'].long(), num_classes=self._action_size).float()
-                
-                # Predict next latent state
-                dummy_states = torch.zeros_like(actions_onehot)
-                z_pred = self.ac_predictor(z[:-1], actions_onehot[:-1], dummy_states[:-1])
-                
-                # V-JEPA prediction loss
-                z_target = z[1:].detach()
-                pred_loss = F.l1_loss(z_pred, z_target)
+                B, T, H, W, C = data['image'].shape
+                tubelet_size = 2
+                patch_size = 16
+                T_patches = T // tubelet_size
+                H_patches = H // patch_size
+                W_patches = W // patch_size
+                D = z_patches.shape[-1]
 
-                # DreamerV3 head losses
+                # Reshape to (B, T_patches, num_spatial_patches, D)
+                num_spatial_patches = H_patches * W_patches
+                z_seq_patches = z_patches.view(B, T_patches, num_spatial_patches, D)
+
+                # Subsample actions to match temporal resolution of z
+                actions_sub = data['action'][:, ::tubelet_size]
+                dummy_states = torch.zeros_like(actions_sub)
+
+                # Prepare inputs for the predictor.
+                # The predictor expects a 3D tensor (B, SEQ, D) where SEQ is the flattened time and space dimensions.
+                predictor_input = z_seq_patches[:, :-1].flatten(1, 2)
+
+                # The actions and states should be a simple time sequence.
+                actions_for_pred = actions_sub[:, :-1]
+                states_for_pred = dummy_states[:, :-1]
+
+                z_pred_patches = self.ac_predictor(predictor_input, actions_for_pred, states_for_pred)
+
+                # V-JEPA prediction loss
+                z_target_patches = z_seq_patches[:, 1:].flatten(1, 2).detach()
+                pred_loss = F.l1_loss(z_pred_patches, z_target_patches)
+
+                # DreamerV3 head losses (on aggregated features)
+                z_seq_agg = z_seq_patches.mean(dim=2)
+                feats = z_seq_agg.detach()
+                
+                reward_data = data['reward'][:, ::tubelet_size]
+                cont_data = data['cont'][:, ::tubelet_size]
+
                 head_losses = {}
-                feats = z.detach() # Use detached features for heads
-                for name, head in self.heads.items():
-                    pred = head(feats)
-                    loss = -pred.log_prob(data[name])
-                    head_losses[name] = loss.mean()
+                pred_reward = self.heads['reward'](feats)
+                head_losses['reward'] = -pred_reward.log_prob(reward_data).mean()
+
+                pred_cont = self.heads['cont'](feats)
+                head_losses['cont'] = -pred_cont.log_prob(cont_data).mean()
 
                 total_loss = pred_loss + head_losses['reward'] + head_losses['cont']
 
@@ -180,40 +213,54 @@ class VJEPAWorldModel(nn.Module):
 
         metrics.update({f'{name}_loss': loss.item() for name, loss in head_losses.items()})
         metrics['vjepa_pred_loss'] = pred_loss.item()
-        
+
         # Return start state for imagination
-        start_z = z.detach()
-        return start_z, {"feat": start_z}, metrics
+        start_z_agg = z_seq_patches[:, 0].mean(dim=1).detach()
+        start_state = {'feat': start_z_agg, 'patches': z_seq_patches[:, 0].detach()}
+        return start_state, {"feat": start_z_agg}, metrics
 
     def encode(self, obs):
-        # obs['image'] is (B, T, H, W, C)
+        img = obs['image']
+        # Handle both 4D (B, H, W, C) and 5D (B, T, H, W, C) inputs
+        if img.dim() == 4:
+            img = img.unsqueeze(1)  # Add time dimension for single-step obs
+        
+        # The V-JEPA patch embed kernel has a temporal size of 2.
+        # If we have only one frame, we need to duplicate it.
+        if img.size(1) == 1:
+            img = img.repeat(1, 2, 1, 1, 1)
+
         # vjepa_encoder expects (B, C, T, H, W)
-        img = obs['image'].permute(0, 4, 1, 2, 3)
+        img = img.permute(0, 4, 1, 2, 3)
         z = self.vjepa_encoder(img)
         return z
 
-    def obs_step(self, prev_latent, prev_action, obs, is_first):
+    def obs_step(self, prev_latent, prev_action, embed, is_first):
         # This method is called by the policy to get the current latent state.
-        # With V-JEPA, the state is not recurrent in the same way as RSSM.
-        # We simply encode the current observation.
-        # prev_latent and prev_action are ignored, but kept for interface compatibility.
+        # With V-JEPA, the state is not recurrent. The new state is simply the
+        # embedding of the current observation, which is passed in as `embed`.
         
-        # If it's the first step, create a zero latent tensor.
+        # If it's the first step of an episode, reset the latent state to zeros.
         if torch.any(is_first):
-            batch_size = is_first.size(0)
-            # This is a bit of a hack, we don't know the feature size without the encoder
-            # Hardcoding 1408 for ViT-g
-            latent = torch.zeros(batch_size, 1408, device=self._config.device)
+            # The latent state is the feature vector from the encoder.
+            # For the first step, we can use a zero vector of the same shape.
+            latent = torch.zeros_like(embed)
         else:
-            latent = self.encode(obs)
+            latent = embed
         return latent
 
-    def imagine_step(self, z, action):
-        # Used by ImagBehavior to unroll trajectories
-        action_onehot = F.one_hot(action.long(), num_classes=self._action_size).float()
-        dummy_state = torch.zeros_like(action_onehot)
-        z_next = self.ac_predictor(z, action_onehot, dummy_state)
-        return z_next
+    def imagine_step(self, z_patches, action):
+        # z_patches is (B, N_s, D). Predictor needs a sequence.
+        # We treat the spatial patches as the sequence.
+        B, N_s, D = z_patches.shape
+        
+        # Reshape action to (B, 1, A_size) for the ac_predictor
+        action_reshaped = action.unsqueeze(1) # (B, 1, A_size)
+        dummy_state = torch.zeros_like(action_reshaped)
+
+        # Predict next patches
+        next_z_patches = self.ac_predictor(z_patches, action_reshaped, dummy_state)
+        return next_z_patches
 
     def preprocess(self, obs):
         obs = {k: torch.tensor(v, device=self._config.device) for k, v in obs.items()}
@@ -226,5 +273,8 @@ class VJEPAWorldModel(nn.Module):
         return obs
 
     def get_feat(self, z):
-        # The feature is simply the latent state z
-        return z
+        # z can be (B, N, D) or (H, B, N, D). We aggregate the patch dimension N.
+        # The patch dimension is always the second to last.
+        if z.dim() < 3:
+            return z
+        return z.mean(dim=-2)
