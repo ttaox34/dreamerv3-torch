@@ -6,6 +6,7 @@ result*
 eval_logdir*
 metrics*
 stable-retro-docs*
+external-references*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
