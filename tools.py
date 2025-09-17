@@ -137,6 +137,7 @@ def simulate(
     episodes=0,
     state=None,
 ):
+    last_time = time.time()
     # initialize or unpack simulation state
     if state is None:
         step, episode = 0, 0
@@ -148,8 +149,10 @@ def simulate(
     else:
         step, episode, done, length, obs, agent_state, reward = state
     while (steps and step < steps) or (episodes and episode < episodes):
-        if step % 100 == 0:
-            print(f"Simulating step {step}...", end='\r')
+        current_time = time.time()
+        interval = current_time - last_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Simulating step {step}... interval: {interval:.2f}s")
+        last_time = current_time
         # reset envs if necessary
         if done.any():
             indices = [index for index, d in enumerate(done) if d]

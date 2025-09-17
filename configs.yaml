@@ -197,7 +197,7 @@ retro:
   size: [64, 64]               # Changed from 84x84 to 64x64 for ConvDecoder compatibility
   
   # Visual reward parameters
-  visual_reward: True           # Enable visual reward
+  visual_reward: False           # Enable visual reward
   visual_encoder: 'CLIP'      # Options: CLIP, ResNet, ViT, DINO (ResNet is most stable)
   visual_reward_weight: 0.1     # Weight for visual reward (0.0 = disabled)
   visual_episode_length: 1000   # Episode length for visual reward clustering
@@ -211,6 +211,15 @@ debug:
   batch_length: 20
 
 vjepa_retro:
+  vjepa:
+    use_dummy_models: false # Set to false for real training
+    checkpointing: true
+    pred_context_len: 16
+    adapter_lr: 2e-4
+    adapter_eps: 1e-5
+    adapter_wd: 1e-6
+    adapter_grad_clip: 1000.0
+  model_lr: 2e-4
   task: 'retro_SuperMarioBros-Nes' # Example, can be changed
   steps: 1e6
   action_repeat: 4
@@ -219,13 +228,12 @@ vjepa_retro:
   eval_every: 1e4
   log_every: 1e4
   train_ratio: 512
-  prefill: 2500
+  prefill: 500
   # VJEPA specific configs
   size: [256, 256] # VJEPA was trained on larger images
   video_pred_log: False # VJEPA does not have a decoder for video prediction
   grad_heads: ['reward', 'cont'] # No decoder head to train
-  vjepa_encoder_path: '/data/mingyu/dreamerv3-torch/vjepa2/vitg.pt'
-  vjepa_ac_path: '/data/mingyu/dreamerv3-torch/vjepa2/vjepa2-ac-vitg.pt'
+  vjepa_encoder_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vitg.pt'
+  vjepa_ac_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/pretrained-models/vjepa2-ac-vitg.pt'
   freeze_vjepa_encoder: True
   freeze_vjepa_predictor: True
-
