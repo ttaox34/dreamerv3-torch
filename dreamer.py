@@ -3,6 +3,7 @@ import functools
 import os
 import pathlib
 import sys
+import time
 
 os.environ["MUJOCO_GL"] = "osmesa"
 
@@ -45,14 +46,25 @@ class Dreamer(nn.Module):
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.ImagBehavior(config, self._wm)
         if config.compile and os.name != "nt":
+            print("Compiling world model and task behavior...")
+            compile_start = time.time()
             self._wm = torch.compile(self._wm)
             self._task_behavior = torch.compile(self._task_behavior)
+            compile_end = time.time()
+            print(f"Compiled in {compile_end - compile_start:.2f} seconds.")
         reward = lambda f, s, a: self._wm.heads["reward"](self._wm.get_feat(s)).mean()
         self._expl_behavior = dict(
             greedy=lambda: self._task_behavior,
             random=lambda: expl.Random(config, act_space),
             plan2explore=lambda: expl.Plan2Explore(config, self._wm, reward),
         )[config.expl_behavior]().to(self._config.device)
+
+        print("#" * 10, "Configs", "#" * 10)
+        print(f"batch_size: {config.batch_size}")
+        print(f"batch_length: {config.batch_length}")
+        print(f"train_ratio: {config.train_ratio}")
+        print(f"should_train every: {batch_steps / config.train_ratio} steps")
+        print("#" * 29)
 
     def __call__(self, obs, reset, state=None, training=True):
         step = self._step
@@ -63,7 +75,8 @@ class Dreamer(nn.Module):
                 else self._should_train(step)
             )
             for _ in range(steps):
-                self._train(next(self._dataset))
+                with tools.CPUTimeRecording("agent_train"):
+                    self._train(next(self._dataset))
                 self._update_count += 1
                 self._metrics["update_count"] = self._update_count
             if self._should_log(step):
@@ -74,9 +87,10 @@ class Dreamer(nn.Module):
                     openl = self._wm.video_pred(next(self._dataset))
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
-
-        policy_output, state = self._policy(obs, state, training)
-
+    
+        with tools.CPUTimeRecording("agent_policy"):
+            policy_output, state = self._policy(obs, state, training=training)
+    
         if training:
             self._step += len(reset)
             self._logger.step = self._config.action_repeat * self._step
@@ -128,19 +142,22 @@ class Dreamer(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, context, mets = self._wm._train(data)
+        with tools.CPUTimeRecording("wm_train (total)"):
+            post, context, mets = self._wm._train(data)
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.get_feat(s)
         ).mode()
-        metrics.update(self._task_behavior._train(start, reward)[-1])
+        with tools.CPUTimeRecording("ac_train (total)"):
+            metrics.update(self._task_behavior._train(start, reward)[-1])
         if self._config.expl_behavior != "greedy":
             if hasattr(self._wm, 'vjepa_encoder'):
                 # Plan2Explore not yet compatible with VJEPAWorldModel
                 pass
             else:
-                mets = self._expl_behavior.train(start, context, data)[-1]
+                with tools.CPUTimeRecording("expl_train"):
+                    mets = self._expl_behavior.train(start, context, data)[-1]
                 metrics.update({"expl_" + key: value for key, value in mets.items()})
         for name, value in metrics.items():
             if not name in self._metrics.keys():
@@ -255,6 +272,7 @@ def make_env(config, mode, id):
 
 
 def main(config):
+    torch.backends.cudnn.benchmark = True
     tools.set_seed_everywhere(config.seed)
     if config.deterministic_run:
         tools.enable_deterministic_run()

@@ -54,6 +54,21 @@ class TimeRecording:
         print(self._comment, self._st.elapsed_time(self._nd) / 1000)
 
 
+class CPUTimeRecording:
+    def __init__(self, comment):
+        self._comment = comment
+        self._st = None
+
+    def __enter__(self):
+        self._st = time.time()
+        return self
+
+    def __exit__(self, *args):
+        et = time.time()
+        print(f"TIMER - {self._comment}: {et - self._st:.4f} sec")
+
+
+
 class Logger:
     def __init__(self, logdir, step):
         self._logdir = logdir
@@ -168,6 +183,10 @@ def simulate(
                 add_to_cache(cache, envs[index].id, t)
                 # replace obs with done by initial state
                 obs[index] = result
+        current_time = time.time()
+        interval = current_time - last_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Reset envs done, interval: {interval:.2f}s")
+        last_time = current_time
         # step agents
         obs = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
         action, agent_state = agent(obs, done, agent_state)
@@ -179,6 +198,10 @@ def simulate(
         else:
             action = np.array(action)
         assert len(action) == len(envs)
+        current_time = time.time()
+        interval = current_time - last_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step agents done, interval: {interval:.2f}s")
+        last_time = current_time
         # step envs
         results = [e.step(a) for e, a in zip(envs, action)]
         results = [r() for r in results]
@@ -190,6 +213,10 @@ def simulate(
         length += 1
         step += len(envs)
         length *= 1 - done
+        current_time = time.time()
+        interval = current_time - last_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step envs done, interval: {interval:.2f}s")
+        last_time = current_time
         # add to cache
         for a, result, env in zip(action, results, envs):
             o, r, d, info = result
@@ -202,6 +229,10 @@ def simulate(
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
             add_to_cache(cache, env.id, transition)
+        current_time = time.time()
+        interval = current_time - last_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Add to cache done, interval: {interval:.2f}s")
+        last_time = current_time
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]

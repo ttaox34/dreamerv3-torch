@@ -299,19 +299,21 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
-                imag_feat_patches, imag_state_patches, imag_action = self._imagine(
-                    start, self.actor, self._config.imag_horizon
-                )
+                with tools.CPUTimeRecording("ac_train_imagine"):
+                    imag_feat_patches, imag_state_patches, imag_action = self._imagine(
+                        start, self.actor, self._config.imag_horizon
+                    )
                 imag_feat = self._world_model.get_feat(imag_feat_patches)
                 reward = objective(imag_feat_patches, imag_state_patches, imag_action)
                 actor_ent = self.actor(imag_feat).entropy()
                 
                 # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # VJEPA state is not a distribution
                 
-                # this target is not scaled by ema or sym_log.
-                target, weights, base = self._compute_target(
-                    imag_feat, imag_state_patches, reward
-                )
+                with tools.CPUTimeRecording("ac_train_lambda_returns"):
+                    # this target is not scaled by ema or sym_log.
+                    target, weights, base = self._compute_target(
+                        imag_feat, imag_state_patches, reward
+                    )
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
@@ -326,15 +328,16 @@ class ImagBehavior(nn.Module):
 
         with tools.RequiresGrad(self.value):
             with torch.cuda.amp.autocast(self._use_amp):
-                value = self.value(value_input[:-1].detach())
-                target = torch.stack(target, dim=1)
-                # (time, batch, 1), (time, batch, 1) -> (time, batch)
-                value_loss = -value.log_prob(target.detach())
-                slow_target = self._slow_value(value_input[:-1].detach())
-                if self._config.critic["slow_target"]:
-                    value_loss -= value.log_prob(slow_target.mode().detach())
-                # (time, batch, 1), (time, batch, 1) -> (1,)
-                value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
+                with tools.CPUTimeRecording("ac_train_value_update"):
+                    value = self.value(value_input[:-1].detach())
+                    target = torch.stack(target, dim=1)
+                    # (time, batch, 1), (time, batch, 1) -> (time, batch)
+                    value_loss = -value.log_prob(target.detach())
+                    slow_target = self._slow_value(value_input[:-1].detach())
+                    if self._config.critic["slow_target"]:
+                        value_loss -= value.log_prob(slow_target.mode().detach())
+                    # (time, batch, 1), (time, batch, 1) -> (1,)
+                    value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
         metrics.update(tools.tensorstats(target, "target"))
@@ -349,8 +352,9 @@ class ImagBehavior(nn.Module):
             metrics.update(tools.tensorstats(imag_action, "imag_action"))
         metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
         with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            metrics.update(self._value_opt(value_loss, self.value.parameters()))
+            with tools.CPUTimeRecording("ac_train_actor_update"):
+                metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
+                metrics.update(self._value_opt(value_loss, self.value.parameters()))
         return imag_feat, imag_state_patches, imag_action, weights, metrics
 
     def _imagine(self, start, policy, horizon):

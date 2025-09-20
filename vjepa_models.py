@@ -5,6 +5,8 @@ import torch.nn.functional as F
 from pathlib import Path
 import networks
 import tools
+import time
+import os
 
 # Assuming vjepa2 submodule is in the project root
 try:
@@ -126,6 +128,13 @@ class VJEPAWorldModel(nn.Module):
                 param.requires_grad = False
             encoder.eval()
             print("V-JEPA encoder is frozen.")
+
+        # Move to device
+        encoder.to(self._config.device)
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs for V-JEPA encoder via DataParallel.")
+            encoder = nn.DataParallel(encoder)
+
         return encoder
 
     def _load_ac_predictor(self, path, freeze):
@@ -171,18 +180,23 @@ class VJEPAWorldModel(nn.Module):
                 param.requires_grad = False
             predictor.eval()
             print("V-JEPA AC predictor is fully frozen.")
+
+        # Move to device
+        predictor.to(self._config.device)
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs for V-JEPA AC predictor via DataParallel.")
+            predictor = nn.DataParallel(predictor)
         
         return predictor
 
     def _train(self, data):
         data = self.preprocess(data)
 
-        # Encode observations with the frozen encoder without tracking gradients.
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(self._use_amp):
-                z_patches = self.encode(data)
+        with tools.CPUTimeRecording("wm_train_encode"):
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(self._use_amp):
+                    z_patches = self.encode(data)
 
-        # Now, with gradients enabled only for the trainable parts, compute losses.
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 B, T, H, W, C = data['image'].shape
@@ -193,37 +207,27 @@ class VJEPAWorldModel(nn.Module):
                 W_patches = W // patch_size
                 D = z_patches.shape[-1]
 
-                # Reshape to (B, T_patches, num_spatial_patches, D)
                 num_spatial_patches = H_patches * W_patches
                 z_seq_patches = z_patches.view(B, T_patches, num_spatial_patches, D)
 
-                # Subsample actions to match temporal resolution of z
                 actions_sub = data['action'][:, ::tubelet_size]
-                # Create dummy states with the correct dimension for the predictor's state_encoder
                 B, T_sub, _ = actions_sub.shape
                 dummy_states = torch.zeros(B, T_sub, 7, device=actions_sub.device)
 
-                # Prepare inputs for the predictor.
-                # The predictor expects a 3D tensor (B, SEQ, D) where SEQ is the flattened time and space dimensions.
-                # We use a context of the last N patches.
                 context_len = self._config.vjepa['pred_context_len']
                 predictor_input = z_seq_patches[:, -context_len-1:-1].flatten(1, 2)
 
-                # The actions and states must also be sliced to the same context length.
                 actions_for_pred = actions_sub[:, -context_len-1:-1]
                 states_for_pred = dummy_states[:, -context_len-1:-1]
 
-                # Adapt actions to the predictor's expected dimension
                 adapted_actions = self.action_adapter(actions_for_pred)
 
-                z_pred_patches = self.ac_predictor(predictor_input, adapted_actions, states_for_pred)
+                with tools.CPUTimeRecording("wm_train_ac_predictor"):
+                    z_pred_patches = self.ac_predictor(predictor_input, adapted_actions, states_for_pred)
 
-                # V-JEPA prediction loss (trains the action_adapter)
-                # The target must match the predictor's output, which is a prediction of the next `context_len` steps.
                 z_target_patches = z_seq_patches[:, -context_len:].flatten(1, 2).detach()
                 pred_loss = F.l1_loss(z_pred_patches, z_target_patches)
 
-                # DreamerV3 head losses (on aggregated features)
                 z_seq_agg = z_seq_patches.mean(dim=2)
                 feats = z_seq_agg.detach()
                 
@@ -237,18 +241,17 @@ class VJEPAWorldModel(nn.Module):
                 pred_cont = self.heads['cont'](feats)
                 head_losses['cont'] = -pred_cont.log_prob(cont_data).mean()
 
-                # Separate optimizers for adapter and heads
                 adapter_loss = pred_loss
                 model_loss = head_losses['reward'] + head_losses['cont']
 
-            # Apply optimizers
-            metrics = self._adapter_opt(adapter_loss, self.action_adapter.parameters())
-            metrics.update(self._model_opt(model_loss, self.heads.parameters()))
+            with tools.CPUTimeRecording("wm_train_adapter_opt"):
+                metrics = self._adapter_opt(adapter_loss, self.action_adapter.parameters())
+            with tools.CPUTimeRecording("wm_train_model_opt"):
+                metrics.update(self._model_opt(model_loss, self.heads.parameters()))
 
         metrics.update({f'{name}_loss': loss.item() for name, loss in head_losses.items()})
         metrics['vjepa_pred_loss'] = pred_loss.item()
 
-        # Return start state for imagination
         start_z_agg = z_seq_patches[:, 0].mean(dim=1).detach()
         start_state = {'feat': start_z_agg, 'patches': z_seq_patches[:, 0].detach()}
         return start_state, {"feat": start_z_agg}, metrics
