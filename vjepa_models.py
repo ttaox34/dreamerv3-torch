@@ -7,10 +7,11 @@ import networks
 import tools
 import time
 import os
+import itertools
 
 # Assuming vjepa2 submodule is in the project root
 try:
-    from vjepa2.hubconf import vjepa2_vit_giant
+    from vjepa2.hubconf import vjepa2_vit_large
     from vjepa2.src.models.ac_predictor import vit_ac_predictor
 except ImportError:
     print("Warning: Could not import from vjepa2 submodule. Make sure it's initialized.")
@@ -46,11 +47,18 @@ class VJEPAWorldModel(nn.Module):
         self.vjepa_encoder = self._load_vjepa_encoder(config.vjepa_encoder_path, config.freeze_vjepa_encoder)
         self.ac_predictor = self._load_ac_predictor(config.vjepa_ac_path, config.freeze_vjepa_predictor)
 
-        # --- Action Adapter ---
+        # --- Adapters ---
+        # Action adapter to map environment actions to predictor's expected dimension
         self.action_adapter = nn.Sequential(
             nn.Linear(self._action_size, 512),
             nn.ReLU(),
             nn.Linear(512, self._original_action_dim)
+        )
+        # Space adapter to map ViT-L features (1024) to ViT-g features (1408)
+        self.space_adapter = nn.Sequential(
+            nn.Linear(1024, 1408),
+            nn.ReLU(),
+            nn.Linear(1408, 1408)
         )
 
         # --- DreamerV3 Heads ---
@@ -86,8 +94,10 @@ class VJEPAWorldModel(nn.Module):
         self._model_opt = tools.Optimizer(
             "model", self.heads.parameters(), config.model_lr, config.opt_eps, config.grad_clip,
             config.weight_decay, opt=config.opt, use_amp=self._use_amp)
+
+        adapter_params = itertools.chain(self.action_adapter.parameters(), self.space_adapter.parameters())
         self._adapter_opt = tools.Optimizer(
-            "adapter", self.action_adapter.parameters(), lr=config.vjepa['adapter_lr'], eps=config.vjepa['adapter_eps'], clip=config.vjepa['adapter_grad_clip'],
+            "adapter", adapter_params, lr=config.vjepa['adapter_lr'], eps=config.vjepa['adapter_eps'], clip=config.vjepa['adapter_grad_clip'],
             wd=config.vjepa['adapter_wd'], opt=config.opt, use_amp=self._use_amp)
 
         print("VJEPA World Model Initialized.")
@@ -96,7 +106,7 @@ class VJEPAWorldModel(nn.Module):
     def _load_vjepa_encoder(self, path, freeze):
         print(f"Loading V-JEPA encoder from {path}")
         # Hardcoding ViT-g for now, can be made configurable
-        encoder = vjepa2_vit_giant(pretrained=False)[0] # Create model instance
+        encoder = vjepa2_vit_large(pretrained=False)[0] # Create model instance
         
         if self._config.vjepa.get('use_dummy_models', False):
             print("Using dummy V-JEPA encoder.")
@@ -193,9 +203,10 @@ class VJEPAWorldModel(nn.Module):
         data = self.preprocess(data)
 
         with tools.CPUTimeRecording("wm_train_encode"):
-            with torch.no_grad():
+            with torch.inference_mode():
                 with torch.cuda.amp.autocast(self._use_amp):
                     z_patches = self.encode(data)
+                z_patches = self.space_adapter(z_patches)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):

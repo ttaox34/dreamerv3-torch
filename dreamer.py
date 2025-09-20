@@ -105,6 +105,8 @@ class Dreamer(nn.Module):
         
         if hasattr(self._wm, 'vjepa_encoder'):
             embed = self._wm.encode(obs)
+            if hasattr(self._wm, 'space_adapter'):
+                embed = self._wm.space_adapter(embed)
             latent = self._wm.obs_step(latent, action, embed, obs["is_first"])
             feat = self._wm.get_feat(latent)
         else: # Original RSSM logic
@@ -411,7 +413,11 @@ def main(config):
             "agent_state_dict": agent.state_dict(),
             "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
         }
+        # Save latest checkpoint
         torch.save(items_to_save, logdir / "latest.pt")
+        # Save checkpoint with step number
+        current_step = int(agent._step)
+        torch.save(items_to_save, logdir / f"checkpoint_{current_step}.pt")
     for env in train_envs + eval_envs:
         try:
             env.close()

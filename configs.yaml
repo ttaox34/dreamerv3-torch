@@ -212,15 +212,15 @@ debug:
 
 vjepa_retro:
   vjepa:
-    use_dummy_models: false # Set to false for real training
-    checkpointing: false
+    use_dummy_models: false
+    checkpointing: true
     pred_context_len: 16
     adapter_lr: 2e-4
     adapter_eps: 1e-5
     adapter_wd: 1e-6
     adapter_grad_clip: 1000.0
   model_lr: 2e-4
-  task: 'retro_BalloonFight-Nes' # Example, can be changed
+  task: 'retro_BomberRaid-Sms'
   steps: 1e5
   action_repeat: 4
   time_limit: 108000
@@ -229,11 +229,37 @@ vjepa_retro:
   log_every: 1e4
   train_ratio: 256
   prefill: 2500
-  # VJEPA specific configs
-  size: [256, 256] # VJEPA was trained on larger images
-  video_pred_log: False # VJEPA does not have a decoder for video prediction
-  grad_heads: ['reward', 'cont'] # No decoder head to train
-  vjepa_encoder_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vitg.pt'
-  vjepa_ac_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vjepa2-ac-vitg.pt'
+  size: [256, 256]
+  video_pred_log: False
+  grad_heads: ['reward', 'cont']
+  vjepa_encoder_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vitg.pt'
+  vjepa_ac_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vjepa2-ac-vitg.pt'
+  freeze_vjepa_encoder: True
+  freeze_vjepa_predictor: True
+
+vjepa_retro_vitl:
+  vjepa:
+    use_dummy_models: false
+    checkpointing: true
+    pred_context_len: 16
+    adapter_lr: 2e-4
+    adapter_eps: 1e-5
+    adapter_wd: 1e-6
+    adapter_grad_clip: 1000.0
+  model_lr: 2e-4
+  task: 'retro_BomberRaid-Sms'
+  steps: 1e5
+  action_repeat: 4
+  time_limit: 108000
+  eval_episode_num: 0
+  eval_every: 1e4
+  log_every: 1e4
+  train_ratio: 256
+  prefill: 2500
+  size: [256, 256]
+  video_pred_log: False
+  grad_heads: ['reward', 'cont']
+  vjepa_encoder_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vitl.pt'
+  vjepa_ac_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vjepa2-ac-vitg.pt'
   freeze_vjepa_encoder: True
   freeze_vjepa_predictor: True
