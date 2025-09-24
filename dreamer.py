@@ -142,6 +142,9 @@ class Dreamer(nn.Module):
             state = (latent, action)
         return policy_output, state
 
+    def on_episode_end(self):
+        self._wm.on_episode_end()
+
     def _train(self, data):
         metrics = {}
         with tools.CPUTimeRecording("wm_train (total)"):

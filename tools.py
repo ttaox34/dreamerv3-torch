@@ -251,6 +251,10 @@ def simulate(
                         # log items won't be used later
                         cache[envs[i].id].pop(key)
 
+                # Reset reward generator at the end of the episode
+                if hasattr(agent, 'on_episode_end'):
+                    agent.on_episode_end()
+
                 if not is_eval:
                     step_in_dataset = erase_over_episodes(cache, limit)
                     logger.scalar(f"dataset_size", step_in_dataset)
@@ -1079,6 +1083,16 @@ class RewardManager:
                 self.reward_mode = 'L3'
         
         print(f"RewardManager initialized with mode: {self.reward_mode}")
+
+    def reset_generator(self):
+        """Resets the reward generator, used for L2 mode at the end of an episode."""
+        if self.reward_mode == 'L2' and self.reward_generator is not None:
+            try:
+                from reward_generator import RewardGenerator
+                print("DEBUG: Resetting RewardGenerator for new episode.")
+                self.reward_generator = RewardGenerator()
+            except ImportError as e:
+                print(f"Warning: Failed to reset RewardGenerator for L2 rewards ({e}).")
 
     def compute_reward(self, base_reward, done, obs=None, features=None):
         if self.reward_mode == 'L1':

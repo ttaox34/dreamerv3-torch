@@ -341,3 +341,7 @@ class VJEPAWorldModel(nn.Module):
         if z.dim() < 3:
             return z
         return z.mean(dim=-2)
+
+    def on_episode_end(self):
+        """Called at the end of an episode to reset components like the reward generator."""
+        self.reward_manager.reset_generator()
