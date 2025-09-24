@@ -100,6 +100,8 @@ class VJEPAWorldModel(nn.Module):
             "adapter", adapter_params, lr=config.vjepa['adapter_lr'], eps=config.vjepa['adapter_eps'], clip=config.vjepa['adapter_grad_clip'],
             wd=config.vjepa['adapter_wd'], opt=config.opt, use_amp=self._use_amp)
 
+        self.reward_manager = tools.RewardManager(config)
+        
         print("VJEPA World Model Initialized.")
         print(f"Trainable parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}")
 
@@ -200,13 +202,14 @@ class VJEPAWorldModel(nn.Module):
         return predictor
 
     def _train(self, data):
+        # print(f"DEBUG: VJEPAWorldModel._train START, type(self.heads['cont']): {type(self.heads['cont'])}")
         data = self.preprocess(data)
 
         with tools.CPUTimeRecording("wm_train_encode"):
             with torch.inference_mode():
                 with torch.cuda.amp.autocast(self._use_amp):
-                    z_patches = self.encode(data)
-                z_patches = self.space_adapter(z_patches)
+                    z_patches_raw = self.encode(data)
+            z_patches = self.space_adapter(z_patches_raw)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
@@ -242,7 +245,14 @@ class VJEPAWorldModel(nn.Module):
                 z_seq_agg = z_seq_patches.mean(dim=2)
                 feats = z_seq_agg.detach()
                 
-                reward_data = data['reward'][:, ::tubelet_size]
+                # Compute reward based on the selected mode
+                reward_data = self.reward_manager.compute_reward(
+                    base_reward=data['reward'], 
+                    done=data['is_terminal'], 
+                    obs=data['image']
+                )
+                reward_data = reward_data[:, ::tubelet_size]
+
                 cont_data = data['cont'][:, ::tubelet_size]
 
                 head_losses = {}
@@ -265,6 +275,7 @@ class VJEPAWorldModel(nn.Module):
 
         start_z_agg = z_seq_patches[:, 0].mean(dim=1).detach()
         start_state = {'feat': start_z_agg, 'patches': z_seq_patches[:, 0].detach()}
+        # print(f"DEBUG: VJEPAWorldModel._train END, type(self.heads['cont']): {type(self.heads['cont'])}")
         return start_state, {"feat": start_z_agg}, metrics
 
     def encode(self, obs):

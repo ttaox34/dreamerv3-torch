@@ -9,9 +9,9 @@ defaults:
   deterministic_run: False
   steps: 1e6
   parallel: False
-  eval_every: 1e4
+  eval_every: 5e3
   eval_episode_num: 10
-  log_every: 1e4
+  log_every: 5e3
   reset_every: 0
   device: 'cuda:0'
   compile: True
@@ -69,8 +69,8 @@ defaults:
   initial: 'learned'
 
   # Training
-  batch_size: 2
-  batch_length: 4
+  batch_size: 16
+  batch_length: 64
   train_ratio: 512
   pretrain: 5
   model_lr: 1e-4
@@ -210,7 +210,14 @@ debug:
   batch_size: 10
   batch_length: 20
 
-vjepa_retro:
+vjepa_base:
+  defaults: [vjepa]
+  reward_mode: 'L1'  # 'L1' for survival, 'L2' for visual, 'L3' for environment
+  survival_reward: 0.1
+  death_penalty: -1.0
+  visual_reward_weight: 0.1
+  visual_encoder: 'CLIP'
+  visual_device: 'auto'
   vjepa:
     use_dummy_models: false
     checkpointing: true
@@ -221,45 +228,26 @@ vjepa_retro:
     adapter_grad_clip: 1000.0
   model_lr: 2e-4
   task: 'retro_BomberRaid-Sms'
-  steps: 1e5
+  steps: 4e4
   action_repeat: 4
   time_limit: 108000
   eval_episode_num: 0
-  eval_every: 1e4
-  log_every: 1e4
+  eval_every: 5e3
+  log_every: 5e3
   train_ratio: 256
   prefill: 2500
   size: [256, 256]
   video_pred_log: False
   grad_heads: ['reward', 'cont']
-  vjepa_encoder_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vitg.pt'
-  vjepa_ac_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vjepa2-ac-vitg.pt'
   freeze_vjepa_encoder: True
   freeze_vjepa_predictor: True
 
+vjepa_retro:
+  defaults: [retro, vjepa_base]
+  vjepa_encoder_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vitg.pt'
+  vjepa_ac_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vjepa2-ac-vitg.pt'
+
 vjepa_retro_vitl:
-  vjepa:
-    use_dummy_models: false
-    checkpointing: true
-    pred_context_len: 16
-    adapter_lr: 2e-4
-    adapter_eps: 1e-5
-    adapter_wd: 1e-6
-    adapter_grad_clip: 1000.0
-  model_lr: 2e-4
-  task: 'retro_BomberRaid-Sms'
-  steps: 1e5
-  action_repeat: 4
-  time_limit: 108000
-  eval_episode_num: 0
-  eval_every: 1e4
-  log_every: 1e4
-  train_ratio: 256
-  prefill: 2500
-  size: [256, 256]
-  video_pred_log: False
-  grad_heads: ['reward', 'cont']
-  vjepa_encoder_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vitl.pt'
-  vjepa_ac_path: '/home/zhuolifeng/dreamerv3-torch/pretrained-models/vjepa2-ac-vitg.pt'
-  freeze_vjepa_encoder: True
-  freeze_vjepa_predictor: True
+  defaults: [retro, vjepa_base]
+  vjepa_encoder_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vitl.pt'
+  vjepa_ac_path: '/inspire/hdd/project/robot-reasoning/xiangyushun-p-xiangyushun/mingyu/genie-game/dreamerv3-torch-vjepa-clean-start/dreamerv3-torch/vjepa2-ac-vitg.pt'

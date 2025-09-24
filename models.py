@@ -289,11 +289,8 @@ class ImagBehavior(nn.Module):
             )
             self.reward_ema = RewardEMA(device=self._config.device)
 
-    def _train(
-        self,
-        start,
-        objective,
-    ):
+    def _train(self, start, objective):
+        # print(f"DEBUG: ImagBehavior._train START, type(self._world_model.heads['cont']): {type(self._world_model.heads['cont'])}")
         self._update_slow_target()
         metrics = {}
 
@@ -304,13 +301,25 @@ class ImagBehavior(nn.Module):
                         start, self.actor, self._config.imag_horizon
                     )
                 imag_feat = self._world_model.get_feat(imag_feat_patches)
-                reward = objective(imag_feat_patches, imag_state_patches, imag_action)
-                actor_ent = self.actor(imag_feat).entropy()
                 
-                # state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() # VJEPA state is not a distribution
+                # Define the comprehensive reward function for imagination here
+                def reward_fn(feat):
+                    # The `objective` is the base reward prediction from the head
+                    base_reward = self._world_model.heads["reward"](feat).mode()
+                    # print(f"DEBUG: reward_fn, type(self._world_model.heads): {type(self._world_model.heads)}")
+                    # print(f"DEBUG: reward_fn, type(self._world_model.heads['cont']): {type(self._world_model.heads['cont'])}")
+                    cont = self._world_model.heads["cont"](feat).mean
+                    done = (1.0 - cont) > 0.5
+                    return self._world_model.reward_manager.compute_reward(
+                        base_reward=base_reward, 
+                        done=done, 
+                        features=feat
+                    )
                 
+                with tools.CPUTimeRecording("ac_train_reward_calc"):
+                    reward = reward_fn(imag_feat)
+                actor_ent = self.actor(imag_feat).entropy()                
                 with tools.CPUTimeRecording("ac_train_lambda_returns"):
-                    # this target is not scaled by ema or sym_log.
                     target, weights, base = self._compute_target(
                         imag_feat, imag_state_patches, reward
                     )
@@ -331,12 +340,10 @@ class ImagBehavior(nn.Module):
                 with tools.CPUTimeRecording("ac_train_value_update"):
                     value = self.value(value_input[:-1].detach())
                     target = torch.stack(target, dim=1)
-                    # (time, batch, 1), (time, batch, 1) -> (time, batch)
                     value_loss = -value.log_prob(target.detach())
                     slow_target = self._slow_value(value_input[:-1].detach())
                     if self._config.critic["slow_target"]:
                         value_loss -= value.log_prob(slow_target.mode().detach())
-                    # (time, batch, 1), (time, batch, 1) -> (1,)
                     value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
         metrics.update(tools.tensorstats(value.mode(), "value"))
@@ -433,7 +440,7 @@ class ImagBehavior(nn.Module):
         inp = imag_feat.detach()
         policy = self.actor(inp)
         # Q-val for actor is not transformed using symlog
-        target = torch.stack(target, dim=1)
+        target = torch.stack(target, dim=0).permute(1, 0, 2)
         if self._config.reward_EMA:
             offset, scale = self.reward_ema(target, self.ema_vals)
             normed_target = (target - offset) / scale

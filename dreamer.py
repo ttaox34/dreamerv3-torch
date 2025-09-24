@@ -146,6 +146,7 @@ class Dreamer(nn.Module):
         metrics = {}
         with tools.CPUTimeRecording("wm_train (total)"):
             post, context, mets = self._wm._train(data)
+        # print(f"DEBUG: Dreamer._train after wm_train, type(self._wm.heads['cont']): {type(self._wm.heads['cont'])}")
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
@@ -288,6 +289,16 @@ def main(config):
 
     print("Logdir", logdir)
     logdir.mkdir(parents=True, exist_ok=True)
+    # Save the config
+    try:
+        config_path = logdir / "config.yaml"
+        with open(config_path, "w") as f:
+            # Use vars to convert Namespace to dict for dumping
+            yaml.dump(vars(config), f, default_flow_style=False)
+        print(f"Saved configuration to {config_path}")
+    except Exception as e:
+        print(f"Error saving configuration: {e}")
+
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)

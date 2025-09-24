@@ -183,10 +183,10 @@ def simulate(
                 add_to_cache(cache, envs[index].id, t)
                 # replace obs with done by initial state
                 obs[index] = result
-        current_time = time.time()
-        interval = current_time - last_time
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Reset envs done, interval: {interval:.2f}s")
-        last_time = current_time
+        # current_time = time.time()
+        # interval = current_time - last_time
+        # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Reset envs done, interval: {interval:.2f}s")
+        # last_time = current_time
         # step agents
         obs = {k: np.stack([o[k] for o in obs]) for k in obs[0] if "log_" not in k}
         action, agent_state = agent(obs, done, agent_state)
@@ -198,10 +198,10 @@ def simulate(
         else:
             action = np.array(action)
         assert len(action) == len(envs)
-        current_time = time.time()
-        interval = current_time - last_time
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step agents done, interval: {interval:.2f}s")
-        last_time = current_time
+        # current_time = time.time()
+        # interval = current_time - last_time
+        # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step agents done, interval: {interval:.2f}s")
+        # last_time = current_time
         # step envs
         results = [e.step(a) for e, a in zip(envs, action)]
         results = [r() for r in results]
@@ -213,10 +213,10 @@ def simulate(
         length += 1
         step += len(envs)
         length *= 1 - done
-        current_time = time.time()
-        interval = current_time - last_time
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step envs done, interval: {interval:.2f}s")
-        last_time = current_time
+        # current_time = time.time()
+        # interval = current_time - last_time
+        # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Step envs done, interval: {interval:.2f}s")
+        # last_time = current_time
         # add to cache
         for a, result, env in zip(action, results, envs):
             o, r, d, info = result
@@ -229,10 +229,10 @@ def simulate(
             transition["reward"] = r
             transition["discount"] = info.get("discount", np.array(1 - float(d)))
             add_to_cache(cache, env.id, transition)
-        current_time = time.time()
-        interval = current_time - last_time
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Add to cache done, interval: {interval:.2f}s")
-        last_time = current_time
+        # current_time = time.time()
+        # interval = current_time - last_time
+        # print(f"[{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(current_time))}] Add to cache done, interval: {interval:.2f}s")
+        # last_time = current_time
 
         if done.any():
             indices = [index for index, d in enumerate(done) if d]
@@ -732,7 +732,9 @@ def static_scan_for_lambda_return(fn, inputs, start):
 def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
     # Setting lambda=1 gives a discounted Monte Carlo return.
     # Setting lambda=0 gives a fixed 1-step return.
-    # assert reward.shape.ndims == value.shape.ndims, (reward.shape, value.shape)
+    # Handle potential dimension mismatch between reward and value.
+    if len(reward.shape) == len(value.shape) - 1 and value.shape[-1] == 1:
+        reward = reward.unsqueeze(-1)
     assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
     if isinstance(pcont, (int, float)):
         pcont = pcont * torch.ones_like(reward)
@@ -1039,3 +1041,75 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
+    for path, state_dict in optimizers_state_dicts.items():
+        keys = path.split(".")
+        obj_now = obj
+        for key in keys:
+            obj_now = getattr(obj_now, key)
+        obj_now.load_state_dict(state_dict)
+
+
+class RewardManager:
+    """Manages different reward modes, now with direct feature support.
+    L1: Survival Reward
+    L2: Visual/Feature-based Novelty Reward
+    L3: Environment's original reward
+    """
+    def __init__(self, config):
+        self.config = config
+        self.reward_mode = config.reward_mode
+        self.device = config.device
+        self.visual_encoder = None
+        self.visual_processor = None
+        self.reward_generator = None
+
+        if self.reward_mode == 'L2':
+            try:
+                from reward_generator import RewardGenerator
+                
+                print("Initializing RewardGenerator for L2 rewards...")
+                self.reward_generator = RewardGenerator()
+
+            except ImportError as e:
+                print(f"Warning: Failed to import RewardGenerator for L2 rewards ({e}).")
+                print("Falling back to L3 environment reward mode.")
+                self.reward_mode = 'L3'
+        
+        print(f"RewardManager initialized with mode: {self.reward_mode}")
+
+    def compute_reward(self, base_reward, done, obs=None, features=None):
+        if self.reward_mode == 'L1':
+            # Ensure rewards are on the correct device
+            survival_rewards = torch.full_like(base_reward, self.config.survival_reward)
+            death_penalties = torch.full_like(base_reward, self.config.death_penalty)
+            return torch.where(done, death_penalties, survival_rewards)
+
+        elif self.reward_mode == 'L2' and self.reward_generator is not None:
+            if features is None:
+                # Features are required for L2 reward, but were not provided.
+                return base_reward
+
+            # The reward_generator works on individual vectors. We need to flatten
+            # the (Time, Batch, Dim) features tensor and process each vector.
+            T, B, D = features.shape
+            input_features_flat = features.reshape(T * B, D).detach().cpu().numpy()
+
+            novelty_rewards = [
+                self.reward_generator.generate_reward(feat_vec)
+                for feat_vec in input_features_flat
+            ]
+            
+            novelty_tensor = torch.tensor(novelty_rewards, dtype=torch.float32, device=self.device)
+            novelty_tensor = novelty_tensor.view(T, B)  # Reshape to (Time, Batch)
+
+            # Squeeze the last dimension of base_reward if it exists
+            if base_reward.shape[-1] == 1:
+                base_reward = base_reward.squeeze(-1)
+
+            return base_reward + novelty_tensor * self.config.visual_reward_weight
+
+        # L3 mode or fallback
+        return base_reward
