@@ -1003,3 +1003,27 @@ def recursively_load_optim_state_dict(obj, optimizers_state_dicts):
         for key in keys:
             obj_now = getattr(obj_now, key)
         obj_now.load_state_dict(state_dict)
+
+
+def save_agent_state_dict(agent):
+    """Save state dict that handles multi-game actors and critics properly"""
+    state_dict = agent.state_dict()
+    
+    # Create a new state dict with proper multi-game structure
+    new_state_dict = {}
+    
+    for key, value in state_dict.items():
+        # If key contains actor or critic, handle it appropriately
+        if "actors." in key or "critics." in key:
+            new_state_dict[key] = value
+        else:
+            # Otherwise, it's a shared component
+            new_state_dict[key] = value
+    
+    return new_state_dict
+
+
+def load_agent_state_dict(agent, state_dict):
+    """Load state dict that handles multi-game actors and critics properly"""
+    # Directly load the state dict - PyTorch handles the module structure
+    agent.load_state_dict(state_dict, strict=False)

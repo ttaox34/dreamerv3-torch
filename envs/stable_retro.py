@@ -108,11 +108,7 @@ class StableRetro(gym.Env):
             n_buttons = self._env.action_space.n
             # Create discrete space with 2^n_buttons possible combinations
             # But limit to reasonable number to avoid memory issues
-            if n_buttons <= 10:  # Max 1024 combinations
-                n_actions = 2 ** n_buttons
-            else:
-                # For too many buttons, use filtered actions if available
-                n_actions = min(2 ** n_buttons, 512)  # Cap at 512 actions
+            n_actions = 2 ** n_buttons
             
             self.action_space = gym.spaces.Discrete(n_actions)
             self._n_buttons = n_buttons

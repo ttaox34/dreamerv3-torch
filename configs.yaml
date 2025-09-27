@@ -9,7 +9,7 @@ defaults:
   deterministic_run: False
   steps: 1e6
   parallel: False
-  eval_every: 1e4
+  eval_every: 1e3
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
@@ -26,7 +26,7 @@ defaults:
   action_repeat: 2
   time_limit: 1000
   grayscale: False
-  prefill: 2500
+  prefill: 1000
   reward_EMA: True
   
   # Visual reward (default disabled)
@@ -72,7 +72,7 @@ defaults:
   batch_size: 16
   batch_length: 64
   train_ratio: 512
-  pretrain: 100
+  pretrain: 10
   model_lr: 1e-4
   opt_eps: 1e-8
   grad_clip: 1000
@@ -189,7 +189,7 @@ retro:
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
-  eval_episode_num: 10
+  eval_episode_num: 1
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   grayscale: False

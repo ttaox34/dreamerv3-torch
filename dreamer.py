@@ -26,7 +26,7 @@ to_np = lambda x: x.detach().cpu().numpy()
 
 
 class Dreamer(nn.Module):
-    def __init__(self, obs_space, act_space, config, logger, dataset):
+    def __init__(self, obs_space, act_space, config, logger, dataset, game_name, game_action_spaces):
         super(Dreamer, self).__init__()
         self._config = config
         self._logger = logger
@@ -41,8 +41,11 @@ class Dreamer(nn.Module):
         self._step = logger.step // config.action_repeat
         self._update_count = 0
         self._dataset = dataset
+        self._game_name = game_name  # Add game name to identify current game
+        # Add game_action_spaces to config for multi-game RSSM support
+        config.game_action_spaces = game_action_spaces
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
-        self._task_behavior = models.ImagBehavior(config, self._wm)
+        self._task_behavior = models.MultiGameImagBehavior(config, self._wm, game_action_spaces)
         if (
             config.compile and os.name != "nt"
         ):  # compilation is not supported on windows
@@ -72,7 +75,7 @@ class Dreamer(nn.Module):
                     self._logger.scalar(name, float(np.mean(values)))
                     self._metrics[name] = []
                 if self._config.video_pred_log:
-                    openl = self._wm.video_pred(next(self._dataset))
+                    openl = self._wm.video_pred(next(self._dataset), game_name=self._game_name)
                     self._logger.video("train_openl", to_np(openl))
                 self._logger.write(fps=True)
 
@@ -84,24 +87,42 @@ class Dreamer(nn.Module):
         return policy_output, state
 
     def _policy(self, obs, state, training):
+        # Debug information
+        # print(f"DEBUG: _policy called for game {self._game_name}")
         if state is None:
+            # print("DEBUG: State is None")
             latent = action = None
         else:
             latent, action = state
+            # print(f"DEBUG: State exists, action shape: {action.shape if action is not None else 'None'}")
+            
+            # Make sure action dimension matches the current game
+            if action is not None:
+                expected_action_size = self._config.num_actions
+                actual_action_size = action.shape[-1]
+                # print(f"DEBUG: Expected action size: {expected_action_size}, Actual action size: {actual_action_size}")
+                if actual_action_size != expected_action_size:
+                    # If action size doesn't match current game, reset to None
+                    # This should trigger initialization in obs_step
+                    # print(f"DEBUG: Action size mismatch, resetting state")
+                    latent = action = None
+
         obs = self._wm.preprocess(obs)
         embed = self._wm.encoder(obs)
-        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"])
+        # print(f"DEBUG: Calling obs_step with game {self._game_name}")
+        latent, _ = self._wm.dynamics.obs_step(latent, action, embed, obs["is_first"], game_name=self._game_name)
         if self._config.eval_state_mean:
             latent["stoch"] = latent["mean"]
         feat = self._wm.dynamics.get_feat(latent)
         if not training:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actors[self._game_name](feat)
             action = actor.mode()
         elif self._should_expl(self._step):
-            actor = self._expl_behavior.actor(feat)
+            # For exploration, we need to use the current game's actor
+            actor = self._task_behavior.actors[self._game_name](feat)
             action = actor.sample()
         else:
-            actor = self._task_behavior.actor(feat)
+            actor = self._task_behavior.actors[self._game_name](feat)
             action = actor.sample()
         logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
@@ -116,15 +137,20 @@ class Dreamer(nn.Module):
 
     def _train(self, data):
         metrics = {}
-        post, context, mets = self._wm._train(data)
+        post, context, mets = self._wm._train(data, game_name=self._game_name)
         metrics.update(mets)
         start = post
         reward = lambda f, s, a: self._wm.heads["reward"](
             self._wm.dynamics.get_feat(s)
         ).mode()
-        metrics.update(self._task_behavior._train(start, reward)[-1])
+        metrics.update(self._task_behavior._train(start, reward, self._game_name)[-1])
         if self._config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train(start, context, data)[-1]
+            if hasattr(self._expl_behavior, 'train') and hasattr(self._expl_behavior, '_behavior'):
+                # For Plan2Explore, we need to pass the task behavior
+                mets = self._expl_behavior.train(start, context, data, self._task_behavior)[-1]
+            else:
+                # For other exploration methods
+                mets = self._expl_behavior.train(start, context, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
         for name, value in metrics.items():
             if not name in self._metrics.keys():
@@ -257,130 +283,341 @@ def main(config):
     logger = tools.Logger(logdir, config.action_repeat * step)
 
     print("Create envs.")
-    if config.offline_traindir:
-        directory = config.offline_traindir.format(**vars(config))
-    else:
-        directory = config.traindir
-    train_eps = tools.load_episodes(directory, limit=config.dataset_size)
-    if config.offline_evaldir:
-        directory = config.offline_evaldir.format(**vars(config))
-    else:
-        directory = config.evaldir
-    eval_eps = tools.load_episodes(directory, limit=1)
-    make = lambda mode, id: make_env(config, mode, id)
     
-    # Special handling for retro environments due to single emulator limitation
+    # Handle multiple games for retro environments
     suite, task = config.task.split("_", 1)
-    if suite == "retro":
-        # For retro, create only one environment and reuse for both train and eval
-        print("Warning: Using single environment for both train and eval due to retro emulator limitation")
-        shared_env = make("train", 0)
-        train_envs = [shared_env]
-        eval_envs = [shared_env]  # Reuse the same environment
-    else:
-        train_envs = [make("train", i) for i in range(config.envs)]
-        eval_envs = [make("eval", i) for i in range(config.envs)]
     
-    if config.parallel:
-        train_envs = [Parallel(env, "process") for env in train_envs]
-        eval_envs = [Parallel(env, "process") for env in eval_envs]
-    else:
-        train_envs = [Damy(env) for env in train_envs]
-        eval_envs = [Damy(env) for env in eval_envs]
-    acts = train_envs[0].action_space
-    print("Action Space", acts)
-    config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
-
-    state = None
-    if not config.offline_traindir:
-        prefill = max(0, config.prefill - count_steps(config.traindir))
-        print(f"Prefill dataset ({prefill} steps).")
-        if hasattr(acts, "discrete"):
-            random_actor = tools.OneHotDist(
-                torch.zeros(config.num_actions).repeat(config.envs, 1)
-            )
-        else:
-            random_actor = torchd.independent.Independent(
-                torchd.uniform.Uniform(
-                    torch.tensor(acts.low).repeat(config.envs, 1),
-                    torch.tensor(acts.high).repeat(config.envs, 1),
-                ),
-                1,
-            )
-
-        def random_agent(o, d, s):
-            action = random_actor.sample()
-            logprob = random_actor.log_prob(action)
-            return {"action": action, "logprob": logprob}, None
-
-        state = tools.simulate(
-            random_agent,
-            train_envs,
-            train_eps,
-            config.traindir,
+    if suite == "retro":
+        # Parse multiple games from task config - format like "retro_game1,game2,game3"
+        games = task.split(",") if "," in task else [task]
+        
+        # Create action space mapping for all games
+        game_action_spaces = {}
+        for game in games:
+            temp_env = make_env(type('Config', (), {
+                'task': f"retro_{game}",
+                'action_repeat': config.action_repeat,
+                'size': config.size,
+                'grayscale': getattr(config, 'grayscale', False),
+                'seed': config.seed,
+                'time_limit': getattr(config, 'time_limit', 1000)  # Add missing attribute
+            })(), "train", 0)
+            game_action_spaces[game] = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
+            temp_env.close()
+        
+        print(f"Multi-game setup: {list(game_action_spaces.keys())}")
+        print(f"Action spaces: {game_action_spaces}")
+        
+        # Initialize with first game to get observation space
+        first_game_config = type('Config', (), {
+            'task': f"retro_{games[0]}",
+            'action_repeat': config.action_repeat,
+            'size': config.size,
+            'grayscale': getattr(config, 'grayscale', False),
+            'seed': config.seed,
+            'time_limit': getattr(config, 'time_limit', 1000)  # Add missing attribute
+        })()
+        
+        # Get observation space from first game
+        temp_env = make_env(first_game_config, "train", 0)
+        obs_space = temp_env.observation_space
+        temp_env.close()
+        
+        # Create the agent with all game action spaces
+        # Set num_actions to the maximum action space across all games for consistent architecture
+        max_action_size = max(game_action_spaces.values())
+        config.num_actions = max_action_size
+        agent = Dreamer(
+            obs_space,
+            None,  # Will be set dynamically per game
+            config,
             logger,
-            limit=config.dataset_size,
-            steps=prefill,
-        )
-        logger.step += prefill * config.action_repeat
-        print(f"Logger: ({logger.step} steps).")
+            None,  # Will be set dynamically per game
+            games[0],  # Start with first game
+            game_action_spaces
+        ).to(config.device)
+        agent.requires_grad_(requires_grad=False)
+        
+        if (logdir / "latest.pt").exists():
+            checkpoint = torch.load(logdir / "latest.pt")
+            tools.load_agent_state_dict(agent, checkpoint["agent_state_dict"])
+            tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+            agent._should_pretrain._once = False
 
-    print("Simulate agent.")
-    train_dataset = make_dataset(train_eps, config)
-    eval_dataset = make_dataset(eval_eps, config)
-    agent = Dreamer(
-        train_envs[0].observation_space,
-        train_envs[0].action_space,
-        config,
-        logger,
-        train_dataset,
-    ).to(config.device)
-    agent.requires_grad_(requires_grad=False)
-    if (logdir / "latest.pt").exists():
-        checkpoint = torch.load(logdir / "latest.pt")
-        agent.load_state_dict(checkpoint["agent_state_dict"])
-        tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
-        agent._should_pretrain._once = False
+        # Training loop for multiple retro games
+        current_game_idx = 0
+        while agent._step < config.steps + config.eval_every:
+            current_game = games[current_game_idx]
+            print(f"Switching to game: {current_game}")
+            
+            # Change the agent's current game
+            agent._game_name = current_game
+            
+            # Create environment for current game
+            current_config = type('Config', (), {
+                'task': f"retro_{current_game}",
+                'action_repeat': config.action_repeat,
+                'size': config.size,
+                'grayscale': getattr(config, 'grayscale', False),
+                'seed': config.seed + current_game_idx,
+                'time_limit': getattr(config, 'time_limit', 1000)  # Add missing attribute
+            })()
+            
+            # Create the environment and datasets for current game
+            if config.offline_traindir:
+                directory = config.offline_traindir.format(**vars(config))
+            else:
+                directory = config.traindir / current_game  # Separate directory per game
+            directory.mkdir(parents=True, exist_ok=True)
+            train_eps = tools.load_episodes(directory, limit=config.dataset_size)
+            
+            if config.offline_evaldir:
+                eval_directory = config.offline_evaldir.format(**vars(config))
+            else:
+                eval_directory = config.evaldir / current_game  # Separate directory per game
+            eval_directory.mkdir(parents=True, exist_ok=True)
+            eval_eps = tools.load_episodes(eval_directory, limit=1)
+            
+            # Create environments for current game
+            shared_env = make_env(current_config, "train", 0)
+            train_envs = [shared_env]
+            eval_envs = [shared_env]  # Reuse the same environment
+            
+            if config.parallel:
+                train_envs = [Parallel(env, "process") for env in train_envs]
+                eval_envs = [Parallel(env, "process") for env in eval_envs]
+            else:
+                train_envs = [Damy(env) for env in train_envs]
+                eval_envs = [Damy(env) for env in eval_envs]
+                
+            acts = train_envs[0].action_space
+            print(f"Action Space for {current_game}: {acts}")
+            config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+            
+            # Set the dataset for the current game
+            train_dataset = make_dataset(train_eps, config)
+            agent._dataset = train_dataset  # Update the agent's dataset
+            
+            # Update exploration behavior with the current game's task behavior
+            reward = lambda f, s, a: agent._wm.heads["reward"](f).mean()
+            plan2explore_fn = lambda: expl.Plan2Explore(config, agent._wm, reward)
+            agent._expl_behavior = dict(
+                greedy=lambda: agent._task_behavior,
+                random=lambda: expl.Random(config, acts),
+                plan2explore=plan2explore_fn,
+            )[config.expl_behavior]().to(config.device)
 
-    # make sure eval will be executed once after config.steps
-    while agent._step < config.steps + config.eval_every:
-        logger.write()
-        if config.eval_episode_num > 0:
-            print("Start evaluation.")
-            eval_policy = functools.partial(agent, training=False)
-            tools.simulate(
-                eval_policy,
-                eval_envs,
-                eval_eps,
-                config.evaldir,
+            state = None
+            if not config.offline_traindir:
+                prefill = max(0, config.prefill - count_steps(config.traindir / current_game))
+                print(f"Prefill dataset for {current_game} ({prefill} steps).")
+                if hasattr(acts, "discrete"):
+                    random_actor = tools.OneHotDist(
+                        torch.zeros(config.num_actions).repeat(config.envs, 1)
+                    )
+                else:
+                    random_actor = torchd.independent.Independent(
+                        torchd.uniform.Uniform(
+                            torch.tensor(acts.low).repeat(config.envs, 1),
+                            torch.tensor(acts.high).repeat(config.envs, 1),
+                        ),
+                        1,
+                    )
+
+                def random_agent(o, d, s):
+                    action = random_actor.sample()
+                    logprob = random_actor.log_prob(action)
+                    return {"action": action, "logprob": logprob}, None
+
+                state = tools.simulate(
+                    random_agent,
+                    train_envs,
+                    train_eps,
+                    config.traindir / current_game,
+                    logger,
+                    limit=config.dataset_size,
+                    steps=prefill,
+                )
+                logger.step += prefill * config.action_repeat
+                print(f"Logger: ({logger.step} steps).")
+
+            print(f"Simulate agent for {current_game}.")
+            eval_dataset = make_dataset(eval_eps, config)
+            
+            logger.write()
+            if config.eval_episode_num > 0:
+                print(f"Start evaluation for {current_game}.")
+                eval_policy = functools.partial(agent, training=False)
+                tools.simulate(
+                    eval_policy,
+                    eval_envs,
+                    eval_eps,
+                    config.evaldir / current_game,
+                    logger,
+                    is_eval=True,
+                    episodes=config.eval_episode_num,
+                )
+                if config.video_pred_log:
+                    video_pred = agent._wm.video_pred(next(eval_dataset), game_name=agent._game_name)
+                    logger.video(f"eval_openl_{current_game}", to_np(video_pred))
+            
+            print(f"Start training for {current_game}.")
+            state = tools.simulate(
+                agent,
+                train_envs,
+                train_eps,
+                config.traindir / current_game,
                 logger,
-                is_eval=True,
-                episodes=config.eval_episode_num,
+                limit=config.dataset_size,
+                steps=config.eval_every,
+                state=state,
             )
-            if config.video_pred_log:
-                video_pred = agent._wm.video_pred(next(eval_dataset))
-                logger.video("eval_openl", to_np(video_pred))
-        print("Start training.")
-        state = tools.simulate(
-            agent,
-            train_envs,
-            train_eps,
-            config.traindir,
+            
+            # Switch to next game for next iteration
+            current_game_idx = (current_game_idx + 1) % len(games)
+            
+            # Save model checkpoint
+            items_to_save = {
+                "agent_state_dict": tools.save_agent_state_dict(agent),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+                "game_action_spaces": game_action_spaces,  # Save game action spaces info
+                "step": logger.step  # Save current step
+            }
+            torch.save(items_to_save, logdir / "latest.pt")
+            
+            # Close current environment
+            for env in train_envs + eval_envs:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+    else:
+        # Original code for non-retro environments
+        if config.offline_traindir:
+            directory = config.offline_traindir.format(**vars(config))
+        else:
+            directory = config.traindir
+        train_eps = tools.load_episodes(directory, limit=config.dataset_size)
+        if config.offline_evaldir:
+            directory = config.offline_evaldir.format(**vars(config))
+        else:
+            directory = config.evaldir
+        eval_eps = tools.load_episodes(directory, limit=1)
+        make = lambda mode, id: make_env(config, mode, id)
+        
+        # Special handling for retro environments due to single emulator limitation
+        if suite == "retro":
+            # For retro, create only one environment and reuse for both train and eval
+            print("Warning: Using single environment for both train and eval due to retro emulator limitation")
+            shared_env = make("train", 0)
+            train_envs = [shared_env]
+            eval_envs = [shared_env]  # Reuse the same environment
+        else:
+            train_envs = [make("train", i) for i in range(config.envs)]
+            eval_envs = [make("eval", i) for i in range(config.envs)]
+        
+        if config.parallel:
+            train_envs = [Parallel(env, "process") for env in train_envs]
+            eval_envs = [Parallel(env, "process") for env in eval_envs]
+        else:
+            train_envs = [Damy(env) for env in train_envs]
+            eval_envs = [Damy(env) for env in eval_envs]
+        acts = train_envs[0].action_space
+        print("Action Space", acts)
+        config.num_actions = acts.n if hasattr(acts, "n") else acts.shape[0]
+
+        state = None
+        if not config.offline_traindir:
+            prefill = max(0, config.prefill - count_steps(config.traindir))
+            print(f"Prefill dataset ({prefill} steps).")
+            if hasattr(acts, "discrete"):
+                random_actor = tools.OneHotDist(
+                    torch.zeros(config.num_actions).repeat(config.envs, 1)
+                )
+            else:
+                random_actor = torchd.independent.Independent(
+                    torchd.uniform.Uniform(
+                        torch.tensor(acts.low).repeat(config.envs, 1),
+                        torch.tensor(acts.high).repeat(config.envs, 1),
+                    ),
+                    1,
+                )
+
+            def random_agent(o, d, s):
+                action = random_actor.sample()
+                logprob = random_actor.log_prob(action)
+                return {"action": action, "logprob": logprob}, None
+
+            state = tools.simulate(
+                random_agent,
+                train_envs,
+                train_eps,
+                config.traindir,
+                logger,
+                limit=config.dataset_size,
+                steps=prefill,
+            )
+            logger.step += prefill * config.action_repeat
+            print(f"Logger: ({logger.step} steps).")
+
+        print("Simulate agent.")
+        train_dataset = make_dataset(train_eps, config)
+        eval_dataset = make_dataset(eval_eps, config)
+        agent = Dreamer(
+            train_envs[0].observation_space,
+            train_envs[0].action_space,
+            config,
             logger,
-            limit=config.dataset_size,
-            steps=config.eval_every,
-            state=state,
-        )
-        items_to_save = {
-            "agent_state_dict": agent.state_dict(),
-            "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
-        }
-        torch.save(items_to_save, logdir / "latest.pt")
-    for env in train_envs + eval_envs:
-        try:
-            env.close()
-        except Exception:
-            pass
+            train_dataset,
+            task,  # game name
+            {task: config.num_actions}  # game action spaces (only one game in this case)
+        ).to(config.device)
+        agent.requires_grad_(requires_grad=False)
+        if (logdir / "latest.pt").exists():
+            checkpoint = torch.load(logdir / "latest.pt")
+            tools.load_agent_state_dict(agent, checkpoint["agent_state_dict"])
+            tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
+            agent._should_pretrain._once = False
+
+        # make sure eval will be executed once after config.steps
+        while agent._step < config.steps + config.eval_every:
+            logger.write()
+            if config.eval_episode_num > 0:
+                print("Start evaluation.")
+                eval_policy = functools.partial(agent, training=False)
+                tools.simulate(
+                    eval_policy,
+                    eval_envs,
+                    eval_eps,
+                    config.evaldir,
+                    logger,
+                    is_eval=True,
+                    episodes=config.eval_episode_num,
+                )
+                if config.video_pred_log:
+                    video_pred = agent._wm.video_pred(next(eval_dataset), game_name=agent._game_name)
+                    logger.video("eval_openl", to_np(video_pred))
+            print("Start training.")
+            state = tools.simulate(
+                agent,
+                train_envs,
+                train_eps,
+                config.traindir,
+                logger,
+                limit=config.dataset_size,
+                steps=config.eval_every,
+                state=state,
+            )
+            items_to_save = {
+                "agent_state_dict": agent.state_dict(),
+                "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
+            }
+            torch.save(items_to_save, logdir / "latest.pt")
+        for env in train_envs + eval_envs:
+            try:
+                env.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

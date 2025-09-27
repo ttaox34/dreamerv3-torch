@@ -51,6 +51,7 @@ class WorldModel(nn.Module):
             config.num_actions,
             self.embed_size,
             config.device,
+            getattr(config, 'game_action_spaces', None),  # Pass game action spaces if available
         )
         self.heads = nn.ModuleDict()
         if config.dyn_discrete:
@@ -105,7 +106,7 @@ class WorldModel(nn.Module):
             cont=config.cont_head["loss_scale"],
         )
 
-    def _train(self, data):
+    def _train(self, data, game_name=None):
         # action (batch_size, batch_length, act_dim)
         # image (batch_size, batch_length, h, w, ch)
         # reward (batch_size, batch_length)
@@ -116,7 +117,7 @@ class WorldModel(nn.Module):
             with torch.cuda.amp.autocast(self._use_amp):
                 embed = self.encoder(data)
                 post, prior = self.dynamics.observe(
-                    embed, data["action"], data["is_first"]
+                    embed, data["action"], data["is_first"], game_name=game_name
                 )
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
@@ -188,19 +189,19 @@ class WorldModel(nn.Module):
         obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
         return obs
 
-    def video_pred(self, data):
+    def video_pred(self, data, game_name=None):
         data = self.preprocess(data)
         embed = self.encoder(data)
 
         states, _ = self.dynamics.observe(
-            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
+            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5], game_name=game_name
         )
         recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
             :6
         ]
         reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
+        prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init, game_name=game_name)
         openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
         reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
         # observed image is given until 5 steps
@@ -212,93 +213,121 @@ class WorldModel(nn.Module):
         return torch.cat([truth, model, error], 2)
 
 
-class ImagBehavior(nn.Module):
-    def __init__(self, config, world_model):
-        super(ImagBehavior, self).__init__()
+class MultiGameImagBehavior(nn.Module):
+    def __init__(self, config, world_model, game_action_spaces):
+        super(MultiGameImagBehavior, self).__init__()
         self._use_amp = True if config.precision == 16 else False
         self._config = config
         self._world_model = world_model
         if config.dyn_discrete:
-            feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
+            self._feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
-            feat_size = config.dyn_stoch + config.dyn_deter
-        self.actor = networks.MLP(
-            feat_size,
-            (config.num_actions,),
-            config.actor["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            config.actor["dist"],
-            config.actor["std"],
-            config.actor["min_std"],
-            config.actor["max_std"],
-            absmax=1.0,
-            temp=config.actor["temp"],
-            unimix_ratio=config.actor["unimix_ratio"],
-            outscale=config.actor["outscale"],
-            name="Actor",
-        )
-        self.value = networks.MLP(
-            feat_size,
-            (255,) if config.critic["dist"] == "symlog_disc" else (),
-            config.critic["layers"],
-            config.units,
-            config.act,
-            config.norm,
-            config.critic["dist"],
-            outscale=config.critic["outscale"],
-            device=config.device,
-            name="Value",
-        )
+            self._feat_size = config.dyn_stoch + config.dyn_deter
+        
+        # Create game-specific actors and critics
+        self.actors = nn.ModuleDict()
+        self.critics = nn.ModuleDict()
+        self._actor_opts = {}
+        self._critic_opts = {}
+        
+        for game_name, num_actions in game_action_spaces.items():
+            # Actor for each game - num_actions is already an integer
+            self.actors[game_name] = networks.MLP(
+                self._feat_size,
+                (num_actions,),
+                config.actor["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                config.actor["dist"],
+                config.actor["std"],
+                config.actor["min_std"],
+                config.actor["max_std"],
+                absmax=1.0,
+                temp=config.actor["temp"],
+                unimix_ratio=config.actor["unimix_ratio"],
+                outscale=config.actor["outscale"],
+                name=f"Actor_{game_name}",
+            )
+            
+            # Critic for each game
+            self.critics[game_name] = networks.MLP(
+                self._feat_size,
+                (255,) if config.critic["dist"] == "symlog_disc" else (),
+                config.critic["layers"],
+                config.units,
+                config.act,
+                config.norm,
+                config.critic["dist"],
+                outscale=config.critic["outscale"],
+                device=config.device,
+                name=f"Value_{game_name}",
+            )
+            
+            # Optimizers for each game's actor and critic
+            kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
+            self._actor_opts[game_name] = tools.Optimizer(
+                f"actor_{game_name}",
+                self.actors[game_name].parameters(),
+                config.actor["lr"],
+                config.actor["eps"],
+                config.actor["grad_clip"],
+                **kw,
+            )
+            print(
+                f"Optimizer actor_opt_{game_name} has {sum(param.numel() for param in self.actors[game_name].parameters())} variables."
+            )
+            
+            self._critic_opts[game_name] = tools.Optimizer(
+                f"value_{game_name}",
+                self.critics[game_name].parameters(),
+                config.critic["lr"],
+                config.critic["eps"],
+                config.critic["grad_clip"],
+                **kw,
+            )
+            print(
+                f"Optimizer value_opt_{game_name} has {sum(param.numel() for param in self.critics[game_name].parameters())} variables."
+            )
+        
+        # Set up slow targets for critics if enabled
         if config.critic["slow_target"]:
-            self._slow_value = copy.deepcopy(self.value)
-            self._updates = 0
-        kw = dict(wd=config.weight_decay, opt=config.opt, use_amp=self._use_amp)
-        self._actor_opt = tools.Optimizer(
-            "actor",
-            self.actor.parameters(),
-            config.actor["lr"],
-            config.actor["eps"],
-            config.actor["grad_clip"],
-            **kw,
-        )
-        print(
-            f"Optimizer actor_opt has {sum(param.numel() for param in self.actor.parameters())} variables."
-        )
-        self._value_opt = tools.Optimizer(
-            "value",
-            self.value.parameters(),
-            config.critic["lr"],
-            config.critic["eps"],
-            config.critic["grad_clip"],
-            **kw,
-        )
-        print(
-            f"Optimizer value_opt has {sum(param.numel() for param in self.value.parameters())} variables."
-        )
+            self._slow_critics = {}
+            self._updates = {game: 0 for game in game_action_spaces.keys()}
+            for game_name in game_action_spaces.keys():
+                self._slow_critics[game_name] = copy.deepcopy(self.critics[game_name])
+                # Ensure the slow critic is on the same device as the main critic
+                self._slow_critics[game_name] = self._slow_critics[game_name].to(config.device)
+        
         if self._config.reward_EMA:
             # register ema_vals to nn.Module for enabling torch.save and torch.load
             self.register_buffer(
                 "ema_vals", torch.zeros((2,), device=self._config.device)
             )
             self.reward_ema = RewardEMA(device=self._config.device)
+        
+        # Ensure all models are on the correct device
+        for name, actor in self.actors.items():
+            self.actors[name] = actor.to(config.device)
+        for name, critic in self.critics.items():
+            self.critics[name] = critic.to(config.device)
 
     def _train(
         self,
         start,
         objective,
+        game_name  # Added game_name parameter
     ):
-        self._update_slow_target()
+        self._update_slow_target(game_name)
         metrics = {}
 
-        with tools.RequiresGrad(self.actor):
+        with tools.RequiresGrad(self.actors[game_name]):
             with torch.cuda.amp.autocast(self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
-                    start, self.actor, self._config.imag_horizon
+                    start, self.actors[game_name], self._config.imag_horizon, game_name
                 )
                 reward = objective(imag_feat, imag_state, imag_action)
-                actor_ent = self.actor(imag_feat).entropy()
+                actor_ent = self.actors[game_name](imag_feat).entropy()
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
                 # this target is not scaled by ema or sym_log.
                 target, weights, base = self._compute_target(
@@ -310,42 +339,49 @@ class ImagBehavior(nn.Module):
                     target,
                     weights,
                     base,
+                    game_name
                 )
                 actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
                 actor_loss = torch.mean(actor_loss)
                 metrics.update(mets)
                 value_input = imag_feat
 
-        with tools.RequiresGrad(self.value):
+        with tools.RequiresGrad(self.critics[game_name]):
             with torch.cuda.amp.autocast(self._use_amp):
-                value = self.value(value_input[:-1].detach())
+                value = self.critics[game_name](value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
                 value_loss = -value.log_prob(target.detach())
-                slow_target = self._slow_value(value_input[:-1].detach())
+                
                 if self._config.critic["slow_target"]:
+                    slow_target = self._slow_critics[game_name](value_input[:-1].detach())
                     value_loss -= value.log_prob(slow_target.mode().detach())
+                
                 # (time, batch, 1), (time, batch, 1) -> (1,)
                 value_loss = torch.mean(weights[:-1] * value_loss[:, :, None])
 
-        metrics.update(tools.tensorstats(value.mode(), "value"))
-        metrics.update(tools.tensorstats(target, "target"))
-        metrics.update(tools.tensorstats(reward, "imag_reward"))
+        metrics.update(tools.tensorstats(value.mode(), f"value_{game_name}"))
+        metrics.update(tools.tensorstats(target, f"target_{game_name}"))
+        metrics.update(tools.tensorstats(reward, f"imag_reward_{game_name}"))
         if self._config.actor["dist"] in ["onehot"]:
             metrics.update(
                 tools.tensorstats(
-                    torch.argmax(imag_action, dim=-1).float(), "imag_action"
+                    torch.argmax(imag_action, dim=-1).float(), f"imag_action_{game_name}"
                 )
             )
         else:
-            metrics.update(tools.tensorstats(imag_action, "imag_action"))
-        metrics["actor_entropy"] = to_np(torch.mean(actor_ent))
+            metrics.update(tools.tensorstats(imag_action, f"imag_action_{game_name}"))
+        metrics[f"actor_entropy_{game_name}"] = to_np(torch.mean(actor_ent))
+        
         with tools.RequiresGrad(self):
-            metrics.update(self._actor_opt(actor_loss, self.actor.parameters()))
-            metrics.update(self._value_opt(value_loss, self.value.parameters()))
+            actor_metrics = self._actor_opts[game_name](actor_loss, self.actors[game_name].parameters())
+            critic_metrics = self._critic_opts[game_name](value_loss, self.critics[game_name].parameters())
+            metrics.update(actor_metrics)
+            metrics.update(critic_metrics)
+            
         return imag_feat, imag_state, imag_action, weights, metrics
 
-    def _imagine(self, start, policy, horizon):
+    def _imagine(self, start, policy, horizon, game_name=None):
         dynamics = self._world_model.dynamics
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
         start = {k: flatten(v) for k, v in start.items()}
@@ -355,7 +391,7 @@ class ImagBehavior(nn.Module):
             feat = dynamics.get_feat(state)
             inp = feat.detach()
             action = policy(inp).sample()
-            succ = dynamics.img_step(state, action)
+            succ = dynamics.img_step(state, action, game_name=game_name)
             return succ, feat, action
 
         succ, feats, actions = tools.static_scan(
@@ -371,7 +407,7 @@ class ImagBehavior(nn.Module):
             discount = self._config.discount * self._world_model.heads["cont"](inp).mean
         else:
             discount = self._config.discount * torch.ones_like(reward)
-        value = self.value(imag_feat).mode()
+        value = self.critics[list(self.critics.keys())[0]](imag_feat).mode()  # Use first game's critic to get initial value
         target = tools.lambda_return(
             reward[1:],
             value[:-1],
@@ -392,10 +428,11 @@ class ImagBehavior(nn.Module):
         target,
         weights,
         base,
+        game_name  # Added game_name parameter
     ):
         metrics = {}
         inp = imag_feat.detach()
-        policy = self.actor(inp)
+        policy = self.actors[game_name](inp)
         # Q-val for actor is not transformed using symlog
         target = torch.stack(target, dim=1)
         if self._config.reward_EMA:
@@ -412,12 +449,12 @@ class ImagBehavior(nn.Module):
         elif self._config.imag_gradient == "reinforce":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
+                * (target - self.critics[game_name](imag_feat[:-1]).mode()).detach()
             )
         elif self._config.imag_gradient == "both":
             actor_target = (
                 policy.log_prob(imag_action)[:-1][:, :, None]
-                * (target - self.value(imag_feat[:-1]).mode()).detach()
+                * (target - self.critics[game_name](imag_feat[:-1]).mode()).detach()
             )
             mix = self._config.imag_gradient_mix
             actor_target = mix * target + (1 - mix) * actor_target
@@ -427,10 +464,10 @@ class ImagBehavior(nn.Module):
         actor_loss = -weights[:-1] * actor_target
         return actor_loss, metrics
 
-    def _update_slow_target(self):
+    def _update_slow_target(self, game_name):
         if self._config.critic["slow_target"]:
-            if self._updates % self._config.critic["slow_target_update"] == 0:
+            if self._updates[game_name] % self._config.critic["slow_target_update"] == 0:
                 mix = self._config.critic["slow_target_fraction"]
-                for s, d in zip(self.value.parameters(), self._slow_value.parameters()):
+                for s, d in zip(self.critics[game_name].parameters(), self._slow_critics[game_name].parameters()):
                     d.data = mix * s.data + (1 - mix) * d.data
-            self._updates += 1
+            self._updates[game_name] += 1
