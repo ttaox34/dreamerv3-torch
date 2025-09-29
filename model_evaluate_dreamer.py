@@ -7,11 +7,13 @@ import datetime
 import os
 import sys
 import time
+import pathlib
 import numpy as np
 from PIL import Image
 import torch
 import torch.nn as nn
 from torchvision import transforms
+import ruamel.yaml as yaml
 
 import dreamer
 import tools
@@ -20,43 +22,114 @@ import models
 
 
 def make_env(config, mode, id=0, **kwargs):
-    """Create a Retro environment."""
-    import envs.stable_retro as stable_retro
     from envs import wrappers
-
     suite, task = config.task.split("_", 1)
-    assert suite == "retro", f"Only retro suite is supported, got {suite}"
-    
-    env = stable_retro.StableRetro(
-        game=task,
-        action_repeat=config.action_repeat,
-        size=config.size,
-        grayscale=config.grayscale,
-        seed=config.seed + id if hasattr(config, 'seed') else id,
-    )
-    
-    env = wrappers.OneHotAction(env)
+    if suite == "dmc":
+        import envs.dmc as dmc
+
+        env = dmc.DeepMindControl(
+            task, config.action_repeat, config.size, seed=config.seed + id
+        )
+        env = wrappers.NormalizeActions(env)
+    elif suite == "atari":
+        import envs.atari as atari
+
+        env = atari.Atari(
+            task,
+            config.action_repeat,
+            config.size,
+            gray=config.grayscale,
+            noops=config.noops,
+            lives=config.lives,
+            sticky=config.stickey,
+            actions=config.actions,
+            resize=config.resize,
+            seed=config.seed + id,
+        )
+        env = wrappers.OneHotAction(env)
+    elif suite == "dmlab":
+        import envs.dmlab as dmlab
+
+        env = dmlab.DeepMindLabyrinth(
+            task,
+            mode if "train" in mode else "test",
+            config.action_repeat,
+            seed=config.seed + id,
+        )
+        env = wrappers.OneHotAction(env)
+    elif suite == "memorymaze":
+        from envs.memorymaze import MemoryMaze
+
+        env = MemoryMaze(task, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
+    elif suite == "crafter":
+        import envs.crafter as crafter
+
+        env = crafter.Crafter(task, config.size, seed=config.seed + id)
+        env = wrappers.OneHotAction(env)
+    elif suite == "minecraft":
+        import envs.minecraft as minecraft
+
+        env = minecraft.make_env(task, size=config.size, break_speed=config.break_speed)
+        env = wrappers.OneHotAction(env)
+    elif suite == "retro":
+        import envs.stable_retro as stable_retro
+
+        env = stable_retro.StableRetro(
+            game=task,
+            action_repeat=config.action_repeat,
+            size=config.size,
+            grayscale=config.grayscale,
+            seed=config.seed + id,
+        )
+        
+        # Add reward mode wrapper if enabled
+        if hasattr(config, 'reward_mode') and config.reward_mode in ["L1", "L2", "L3"]:
+            try:
+                from reward_manager import RewardManager, SharedVisualEncoder
+                
+                # Get game name from task
+                game_name = task.replace("retro_", "")  # Remove "retro_" prefix to get game name
+                
+                # Create reward manager with appropriate settings
+                reward_manager = RewardManager(
+                    reward_mode=config.reward_mode,
+                    games_to_train=[game_name],  # Single game context
+                    visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
+                    device=getattr(config, 'device', 'cuda')
+                )
+                
+                from envs.wrappers import RewardModeWrapper
+                env = RewardModeWrapper(env, reward_manager, game_name)
+                print(f"Reward mode {config.reward_mode} enabled for retro environment: {game_name}")
+            except Exception as e:
+                print(f"Warning: Failed to enable reward mode {config.reward_mode}: {e}")
+                print("Continuing with original reward...")
+        
+        env = wrappers.OneHotAction(env)
+    else:
+        raise NotImplementedError(suite)
     env = wrappers.TimeLimit(env, config.time_limit)
     env = wrappers.SelectAction(env, key="action")
     env = wrappers.UUID(env)
-    
+    if suite == "minecraft":
+        env = wrappers.OBS.wrappers.UUID(env)
     return env
 
 
 def main(config):
+    device = torch.device(config.device)
     print(f"Loading checkpoint from: {config.ckpt_path}")
     print(f"Game to evaluate: {config.game}")
+    print(f"Reward mode: {getattr(config, 'reward_mode', 'L3')}")
     
-    # Load configs from configs.yaml to match model training parameters
-    import ruamel.yaml as yaml
-    import pathlib
-    import sys
-
-    configs = yaml.safe_load(
-        (pathlib.Path(sys.argv[0]).parent / "configs.yaml").read_text()
-    )
+    # Load the checkpoint to get saved game information
+    checkpoint = torch.load(config.ckpt_path, map_location=device)
     
-    # Update config with default retro settings
+    # Load default configuration from configs.yaml similar to dreamer.py
+    configs_yaml_path = pathlib.Path(__file__).parent / "configs.yaml"
+    configs = yaml.safe_load(configs_yaml_path.read_text())
+    
     def recursive_update(base, update):
         for key, value in update.items():
             if isinstance(value, dict) and key in base:
@@ -64,12 +137,19 @@ def main(config):
             else:
                 base[key] = value
 
-    name_list = ["defaults", "retro"]  # Use "retro" config as base
+    # Load configs similar to dreamer.py
+    # Get the retro config as base (since we're evaluating retro games)
+    # We need to ensure retro configs properly override defaults
     defaults = {}
-    for name in name_list:
-        recursive_update(defaults, configs[name])
+    # First load defaults
+    recursive_update(defaults, configs["defaults"])
+    # Then override with retro-specific settings
+    recursive_update(defaults, configs["retro"])
     
-    # Update defaults with any command-line overrides
+    # Store command-line value for reward_mode to ensure it's preserved
+    reward_mode_cli = getattr(config, 'reward_mode', 'L3')
+    
+    # Now update config with defaults using the same approach as dreamer.py
     for key, value in defaults.items():
         if not hasattr(config, key):
             setattr(config, key, value)
@@ -77,15 +157,16 @@ def main(config):
     # Set the specific task to the game being evaluated
     config.task = f"retro_{config.game}"
     
-    # Set device
-    device = torch.device(config.device)
+    # Restore command-line reward mode to override config file setting
+    config.reward_mode = reward_mode_cli
     
-    # Load the checkpoint to get saved game information
-    checkpoint = torch.load(config.ckpt_path, map_location=device)
-    
-    # Create a dummy config to get the original config values
-    # We'll need to extract the action space and observation space from the model
-    print("Loading configuration from checkpoint...")
+    # Manually ensure actor config is correct for discrete actions
+    # Since retro games use discrete actions, ensure dist='onehot' and std='none'
+    if hasattr(config, 'actor') and isinstance(config.actor, dict):
+        config.actor['dist'] = 'onehot'
+        config.actor['std'] = 'none'
+    else:
+        config.actor = {'dist': 'onehot', 'std': 'none'}
     
     # First, check if we have game_action_spaces saved in the checkpoint
     if 'game_action_spaces' in checkpoint:
@@ -107,7 +188,11 @@ def main(config):
         'size': config.size,
         'grayscale': getattr(config, 'grayscale', False),
         'time_limit': getattr(config, 'time_limit', 10000),
-        'reward_norm': getattr(config, 'reward_norm', 1.0)
+        'reward_norm': getattr(config, 'reward_norm', 1.0),
+        'seed': getattr(config, 'seed', 0),
+        'device': getattr(config, 'device', 'cuda'),
+        'reward_mode': getattr(config, 'reward_mode', 'L3'),  # Add reward mode
+        'visual_encoder': getattr(config, 'visual_encoder', 'CLIP')  # Add visual encoder
     })()
     
     temp_env = make_env(temp_config, "eval")
@@ -133,10 +218,20 @@ def main(config):
             'size': config.size,
             'grayscale': getattr(config, 'grayscale', False),
             'time_limit': getattr(config, 'time_limit', 1000),
-            'reward_norm': getattr(config, 'reward_norm', 1.0)
+            'reward_norm': getattr(config, 'reward_norm', 1.0),
+            'seed': getattr(config, 'seed', 0),
+            'device': getattr(config, 'device', 'cuda'),
+            'reward_mode': getattr(config, 'reward_mode', 'L3'),  # Add reward mode
+            'visual_encoder': getattr(config, 'visual_encoder', 'CLIP')  # Add visual encoder
         })(), "eval")
         game_action_spaces[config.game] = temp_env.action_space.n if hasattr(temp_env.action_space, "n") else temp_env.action_space.shape[0]
         temp_env.close()
+    
+    # Print debug info to check actor configuration
+    print(f"Actor config after loading: {getattr(config, 'actor', 'NOT SET')}")
+    if hasattr(config, 'actor') and isinstance(config.actor, dict):
+        print(f"  dist: {config.actor.get('dist', 'NOT SET')}")
+        print(f"  std: {config.actor.get('std', 'NOT SET')}")
     
     # Create model with same architecture as training
     print("Creating model...")
@@ -390,6 +485,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_video", action="store_true", help="Save gameplay video")
     parser.add_argument("--fps", type=int, default=60, help="FPS for saved video")
     parser.add_argument("--device", type=str, default="cuda", help="Device to run on")
+    parser.add_argument("--reward_mode", choices=["L1", "L2", "L3"], default="L3", 
+                       help="Reward mode: L1 (survival), L2 (visual), L3 (original env) (default: L3)")
     
     # Add default configurations that match the training config
     parser.add_argument("--action_repeat", type=int, default=4, help="Action repeat")

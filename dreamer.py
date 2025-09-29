@@ -44,6 +44,22 @@ class Dreamer(nn.Module):
         self._game_name = game_name  # Add game name to identify current game
         # Add game_action_spaces to config for multi-game RSSM support
         config.game_action_spaces = game_action_spaces
+        
+        # Initialize reward manager if reward mode is specified
+        self._reward_manager = None
+        if hasattr(config, 'reward_mode') and config.reward_mode in ["L1", "L2", "L3"]:
+            try:
+                from reward_manager import RewardManager
+                self._reward_manager = RewardManager(
+                    reward_mode=config.reward_mode,
+                    games_to_train=list(game_action_spaces.keys()),
+                    visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
+                    device=getattr(config, 'device', 'cuda')
+                )
+                print(f"Reward manager initialized for mode: {config.reward_mode}")
+            except Exception as e:
+                print(f"Warning: Failed to initialize reward manager: {e}")
+        
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
         self._task_behavior = models.MultiGameImagBehavior(config, self._wm, game_action_spaces)
         if (
@@ -230,26 +246,28 @@ def make_env(config, mode, id):
             seed=config.seed + id,
         )
         
-        # Add visual reward wrapper if enabled
-        if getattr(config, 'visual_reward', False) and getattr(config, 'visual_reward_weight', 0.0) > 0.0:
+        # Add reward mode wrapper if enabled
+        if hasattr(config, 'reward_mode') and config.reward_mode in ["L1", "L2", "L3"]:
             try:
-                from envs.visual_reward_wrapper import VisualRewardWrapper
+                from reward_manager import RewardManager, SharedVisualEncoder
                 
-                visual_device = getattr(config, 'visual_device', 'auto')
-                if visual_device == 'auto':
-                    visual_device = config.device if hasattr(config, 'device') else 'auto'
+                # Get game name from task
+                game_name = task.replace("retro_", "")  # Remove "retro_" prefix to get game name
                 
-                env = VisualRewardWrapper(
-                    env,
+                # Create reward manager with appropriate settings
+                reward_manager = RewardManager(
+                    reward_mode=config.reward_mode,
+                    games_to_train=[game_name],  # Single game context
                     visual_encoder=getattr(config, 'visual_encoder', 'CLIP'),
-                    visual_reward_weight=getattr(config, 'visual_reward_weight', 0.1),
-                    episode_length=getattr(config, 'visual_episode_length', 1000),
-                    device=visual_device
+                    device=getattr(config, 'device', 'cuda')
                 )
-                print(f"Visual reward enabled for retro environment (weight: {config.visual_reward_weight})")
+                
+                from envs.wrappers import RewardModeWrapper
+                env = RewardModeWrapper(env, reward_manager, game_name)
+                print(f"Reward mode {config.reward_mode} enabled for retro environment: {game_name}")
             except Exception as e:
-                print(f"Warning: Failed to enable visual reward: {e}")
-                print("Continuing without visual reward...")
+                print(f"Warning: Failed to enable reward mode {config.reward_mode}: {e}")
+                print("Continuing with original reward...")
         
         env = wrappers.OneHotAction(env)
     else:

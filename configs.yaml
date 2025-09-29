@@ -29,9 +29,12 @@ defaults:
   prefill: 1000
   reward_EMA: True
   
-  # Visual reward (default disabled)
+  # Reward mode (L1: survival, L2: visual, L3: original env)
+  reward_mode: 'L1'  # Default to original env reward
+  visual_encoder: 'CLIP'
+  
+  # Visual reward (for L2 mode, default disabled)
   visual_reward: False
-  visual_encoder: 'ResNet'
   visual_reward_weight: 0.0
   visual_episode_length: 1000
   visual_device: 'auto'
@@ -209,3 +212,18 @@ debug:
   prefill: 1
   batch_size: 10
   batch_length: 20
+
+retro_multi_game:
+  steps: 4e5
+  envs: 1                       # Must be 1 for stable-retro (limitation)
+  action_repeat: 4
+  train_ratio: 1024
+  video_pred_log: true
+  eval_episode_num: 1
+  actor: {dist: 'onehot', std: 'none'}
+  imag_gradient: 'reinforce'
+  grayscale: False
+  time_limit: 108000
+  size: [64, 64]               # Changed from 84x84 to 64x64 for ConvDecoder compatibility
+  reward_mode: 'L1'            # Default to original env reward, can be 'L1', 'L2', or 'L3'
+  visual_encoder: 'CLIP'       # For L2 reward mode

@@ -10,33 +10,41 @@ import uuid
 
 
 class TimeLimit(gym.Wrapper):
-    def __init__(self, env, duration):
-        super().__init__(env)
-        self._duration = duration
-        self._step = None
+  def __init__(self, env, duration):
+    super().__init__(env)
+    self._duration = duration
+    self._step = None
 
-    def step(self, action):
-        assert self._step is not None, "Must reset environment."
-        step_result = self.env.step(action)
-        if len(step_result) == 5:
-            # New gym API
-            obs, reward, terminated, truncated, info = step_result
-            done = terminated or truncated
-        else:
-            # Old gym API
-            obs, reward, done, info = step_result
-        
-        self._step += 1
-        if self._step >= self._duration:
-            done = True
-            if "discount" not in info:
-                info["discount"] = np.array(1.0).astype(np.float32)
-            self._step = None
-        return obs, reward, done, info
+  def step(self, action):
+    assert self._step is not None, 'Must reset environment.'
+    obs, reward, done, info = self.env.step(action)
+    self._step += 1
+    if self._step >= self._duration:
+      done = True
+      info['timelimit'] = True
+    return obs, reward, done, info
 
-    def reset(self, **kwargs):
-        self._step = 0
-        return self.env.reset(**kwargs)
+  def reset(self, **kwargs):
+    self._step = 0
+    return self.env.reset(**kwargs)
+
+
+class RewardModeWrapper(gym.Wrapper):
+  """奖励模式包装器，根据指定的奖励模式处理奖励计算"""
+  def __init__(self, env, reward_manager, game_name):
+    super().__init__(env)
+    self.reward_manager = reward_manager
+    self.game_name = game_name
+
+  def step(self, action):
+    obs, env_reward, done, info = self.env.step(action)
+    
+    # 根据奖励模式计算最终奖励
+    final_reward = self.reward_manager.compute_reward(
+        self.game_name, env_reward, done, obs
+    )
+    
+    return obs, final_reward, done, info
 
 
 class NormalizeActions(gym.Wrapper):
