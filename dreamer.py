@@ -296,6 +296,17 @@ def main(config):
     logdir.mkdir(parents=True, exist_ok=True)
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
+    
+    # Save configuration to logdir for reproducibility
+    import ruamel.yaml as yaml
+    configs_yaml_path = pathlib.Path(__file__).parent / "configs.yaml"
+    if configs_yaml_path.exists():
+        saved_configs_path = logdir / "used_config.yaml"
+        saved_configs_path.write_text(configs_yaml_path.read_text())
+        print(f"Configuration saved to {saved_configs_path}")
+    else:
+        print(f"Warning: Config file {configs_yaml_path} not found")
+    
     step = count_steps(config.traindir)
     # step in logger is environmental step
     logger = tools.Logger(logdir, config.action_repeat * step)
@@ -345,6 +356,7 @@ def main(config):
         # Set num_actions to the maximum action space across all games for consistent architecture
         max_action_size = max(game_action_spaces.values())
         config.num_actions = max_action_size
+        # Initialize with first game to get initial agent
         agent = Dreamer(
             obs_space,
             None,  # Will be set dynamically per game
@@ -356,11 +368,22 @@ def main(config):
         ).to(config.device)
         agent.requires_grad_(requires_grad=False)
         
+        # Track which game was being trained when checkpoint was saved
+        current_game_idx = 0  # Default to first game
         if (logdir / "latest.pt").exists():
             checkpoint = torch.load(logdir / "latest.pt")
             tools.load_agent_state_dict(agent, checkpoint["agent_state_dict"])
             tools.recursively_load_optim_state_dict(agent, checkpoint["optims_state_dict"])
             agent._should_pretrain._once = False
+            
+            # If step information exists in checkpoint, try to determine the game that was being trained
+            if "step" in checkpoint:
+                saved_step = checkpoint["step"]
+                # Calculate which game would have been active at that step
+                # Each eval_every steps we switch games, so:
+                total_games_switched = (saved_step // config.eval_every) if config.eval_every > 0 else 0
+                current_game_idx = total_games_switched % len(games)
+                print(f"Resuming from checkpoint at step {saved_step}, starting with game {games[current_game_idx]} (index {current_game_idx})")
 
         # Training loop for multiple retro games
         current_game_idx = 0
@@ -501,7 +524,44 @@ def main(config):
                 "game_action_spaces": game_action_spaces,  # Save game action spaces info
                 "step": logger.step  # Save current step
             }
-            torch.save(items_to_save, logdir / "latest.pt")
+            # Save checkpoint with step number
+            checkpoint_path = logdir / f"model_step_{logger.step}.pt"
+            torch.save(items_to_save, checkpoint_path)
+            # Also keep latest.pt as symlink or copy for convenience
+            import shutil
+            shutil.copy2(checkpoint_path, logdir / "latest.pt")
+            
+            # Optionally, manage old checkpoints to avoid filling disk
+            # Keep only checkpoints at intervals (e.g., every 100k steps) and the last few
+            import re
+            step_pattern = re.compile(r"model_step_(\d+)\.pt")
+            all_checkpoints = []
+            for file in logdir.glob("model_step_*.pt"):
+                match = step_pattern.match(file.name)
+                if match:
+                    step_num = int(match.group(1))
+                    all_checkpoints.append((step_num, file))
+            
+            # Keep checkpoints at intervals of 100k steps + last 5 checkpoints
+            all_checkpoints.sort(key=lambda x: x[0], reverse=True)
+            steps_to_keep = set()
+            for step, _ in all_checkpoints:
+                if step % 100000 == 0:  # Every 100k steps
+                    steps_to_keep.add(step)
+            
+            # Keep the last 5 checkpoints in addition to interval checkpoints
+            last_n = 5
+            for i in range(min(last_n, len(all_checkpoints))):
+                steps_to_keep.add(all_checkpoints[i][0])
+            
+            # Remove checkpoints that are not in the keep list
+            for step, file_path in all_checkpoints:
+                if step not in steps_to_keep:
+                    try:
+                        file_path.remove()
+                        print(f"Removed old checkpoint: {file_path}")
+                    except Exception as e:
+                        print(f"Failed to remove old checkpoint {file_path}: {e}")
             
             # Close current environment
             for env in train_envs + eval_envs:
@@ -630,7 +690,46 @@ def main(config):
                 "agent_state_dict": agent.state_dict(),
                 "optims_state_dict": tools.recursively_collect_optim_state_dict(agent),
             }
-            torch.save(items_to_save, logdir / "latest.pt")
+            # Get step count for non-retro environments
+            step_count = logger.step
+            # Save checkpoint with step number
+            checkpoint_path = logdir / f"model_step_{step_count}.pt"
+            torch.save(items_to_save, checkpoint_path)
+            # Also keep latest.pt as symlink or copy for convenience
+            import shutil
+            shutil.copy2(checkpoint_path, logdir / "latest.pt")
+            
+            # Optionally, manage old checkpoints to avoid filling disk
+            # Keep only checkpoints at intervals (e.g., every 100k steps) and the last few
+            import re
+            step_pattern = re.compile(r"model_step_(\d+)\.pt")
+            all_checkpoints = []
+            for file in logdir.glob("model_step_*.pt"):
+                match = step_pattern.match(file.name)
+                if match:
+                    step_num = int(match.group(1))
+                    all_checkpoints.append((step_num, file))
+            
+            # Keep checkpoints at intervals of 100k steps + last 5 checkpoints
+            all_checkpoints.sort(key=lambda x: x[0], reverse=True)
+            steps_to_keep = set()
+            for step, _ in all_checkpoints:
+                if step % 100000 == 0:  # Every 100k steps
+                    steps_to_keep.add(step)
+            
+            # Keep the last 5 checkpoints in addition to interval checkpoints
+            last_n = 5
+            for i in range(min(last_n, len(all_checkpoints))):
+                steps_to_keep.add(all_checkpoints[i][0])
+            
+            # Remove checkpoints that are not in the keep list
+            for step, file_path in all_checkpoints:
+                if step not in steps_to_keep:
+                    try:
+                        file_path.remove()
+                        print(f"Removed old checkpoint: {file_path}")
+                    except Exception as e:
+                        print(f"Failed to remove old checkpoint {file_path}: {e}")
         for env in train_envs + eval_envs:
             try:
                 env.close()
