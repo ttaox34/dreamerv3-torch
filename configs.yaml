@@ -9,7 +9,7 @@ defaults:
   deterministic_run: False
   steps: 1e6
   parallel: False
-  eval_every: 1e3
+  eval_every: 1e4
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
@@ -26,7 +26,7 @@ defaults:
   action_repeat: 2
   time_limit: 1000
   grayscale: False
-  prefill: 1000
+  prefill: 5000
   reward_EMA: True
   
   # Reward mode (L1: survival, L2: visual, L3: original env)
@@ -72,7 +72,7 @@ defaults:
   initial: 'learned'
 
   # Training
-  batch_size: 16
+  batch_size: 64
   batch_length: 64
   train_ratio: 512
   pretrain: 10
@@ -192,7 +192,7 @@ retro:
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
-  eval_episode_num: 1
+  eval_episode_num: 0
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   grayscale: False
@@ -214,12 +214,12 @@ debug:
   batch_length: 20
 
 retro_multi_game:
-  steps: 4e5
+  steps: 1e8
   envs: 1                       # Must be 1 for stable-retro (limitation)
   action_repeat: 4
   train_ratio: 1024
   video_pred_log: true
-  eval_episode_num: 1
+  eval_episode_num: 0
   actor: {dist: 'onehot', std: 'none'}
   imag_gradient: 'reinforce'
   grayscale: False
