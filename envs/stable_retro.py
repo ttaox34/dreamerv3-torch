@@ -107,12 +107,7 @@ class StableRetro(gym.Env):
             # MultiBinary space
             n_buttons = self._env.action_space.n
             # Create discrete space with 2^n_buttons possible combinations
-            # But limit to reasonable number to avoid memory issues
-            if n_buttons <= 10:  # Max 1024 combinations
-                n_actions = 2 ** n_buttons
-            else:
-                # For too many buttons, use filtered actions if available
-                n_actions = min(2 ** n_buttons, 512)  # Cap at 512 actions
+            n_actions = 2 ** n_buttons
             
             self.action_space = gym.spaces.Discrete(n_actions)
             self._n_buttons = n_buttons
@@ -196,7 +191,6 @@ class StableRetro(gym.Env):
         converted_action = self._convert_action(action)
         
         total_reward = 0.0
-        raw_obs = None
         for _ in range(self._action_repeat):
             step_result = self._env.step(converted_action)
             if len(step_result) == 5:
@@ -208,20 +202,20 @@ class StableRetro(gym.Env):
                 obs, reward, done, info = step_result
             
             total_reward += reward
-            # Store the raw observation from the last step for visual reward
-            raw_obs = obs.copy() if hasattr(obs, 'copy') else obs
+            # Store the raw observation from the last step
+            self._last_raw_obs = obs.copy() if hasattr(obs, 'copy') else obs
             if done:
                 break
         
-        # Store raw observation for visual reward computation
-        self._last_raw_obs = raw_obs
+        # Process observation for the agent
+        processed_obs = self._process_observation(obs)
         
-        # Process observation
-        obs = self._process_observation(obs)
+        # Add raw frame to info dict for easy access through wrappers
+        info['raw_frame'] = self._last_raw_obs
         
         # Return observation in dict format expected by DreamerV3
         return {
-            "image": obs,
+            "image": processed_obs,
             "is_first": False,
             "is_last": done,
             "is_terminal": done,  # For retro games, terminal usually means end of episode

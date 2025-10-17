@@ -40,7 +40,11 @@ class Dreamer(nn.Module):
         self._should_reset = tools.Every(config.reset_every)
         self._should_expl = tools.Until(int(config.expl_until / config.action_repeat))
         self._metrics = {}
-        self._step = logger.step // config.action_repeat
+        # Handle logger step initialization for training and evaluation
+        if logger:
+            self._step = logger.step // config.action_repeat
+        else:
+            self._step = 0
         self._update_count = 0
         self._dataset = dataset
         self._wm = models.WorldModel(obs_space, act_space, self._step, config)
@@ -116,16 +120,12 @@ class Dreamer(nn.Module):
                 latent["stoch"] = latent["mean"]
             feat = self._wm.dynamics.get_feat(latent)
 
-        if not training:
-            actor = self._task_behavior.actor(feat)
-            action = actor.mode()
-        elif self._should_expl(self._step):
-            actor = self._expl_behavior.actor(feat)
-            action = actor.sample()
+        dist = self._task_behavior.actor(feat)
+        if training:
+            action = dist.sample()
         else:
-            actor = self._task_behavior.actor(feat)
-            action = actor.sample()
-        logprob = actor.log_prob(action)
+            action = dist.mode()
+        logprob = dist.log_prob(action)
         
         if hasattr(self._wm, 'vjepa_encoder'):
             state = (latent.detach(), action.detach())
@@ -137,9 +137,7 @@ class Dreamer(nn.Module):
             action = torch.one_hot(
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
-        policy_output = {"action": action, "logprob": logprob}
-        if not hasattr(self._wm, 'vjepa_encoder'):
-            state = (latent, action)
+        policy_output = {'action': action, 'logits': dist.logits}
         return policy_output, state
 
     def on_episode_end(self):
