@@ -3,11 +3,11 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from pathlib import Path
+from typing import Optional
+import math
+
 import networks
 import tools
-import time
-import os
-import itertools
 
 # Assuming vjepa2 submodule is in the project root
 try:
@@ -26,6 +26,11 @@ except ImportError:
     vit_ac_predictor = lambda **kwargs: DummyModel()
 
 
+class _IdentityPredictor(nn.Module):
+    def forward(self, x, *args, **kwargs):
+        return x
+
+
 class VJEPAWorldModel(nn.Module):
     """
     World model based on V-JEPA 2 AC, replacing the RSSM.
@@ -35,36 +40,83 @@ class VJEPAWorldModel(nn.Module):
         self._config = config
         self._step = step
         self._act_space = act_space
-        self._use_amp = True if config.precision == 16 else False
-        
+        self._use_amp = config.precision == 16
+        self._vjepa_cfg = getattr(config, "vjepa", {})
+
         # Determine action space size
-        if hasattr(act_space, 'n'):
+        if hasattr(act_space, "n"):
             self._action_size = act_space.n
         else:
             self._action_size = act_space.shape[0]
 
-        # --- V-JEPA Models ---
-        self.vjepa_encoder = self._load_vjepa_encoder(config.vjepa_encoder_path, config.freeze_vjepa_encoder)
-        self.ac_predictor = self._load_ac_predictor(config.vjepa_ac_path, config.freeze_vjepa_predictor)
-
-        # --- Adapters ---
-        # Action adapter to map environment actions to predictor's expected dimension
-        self.action_adapter = nn.Sequential(
-            nn.Linear(self._action_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, self._original_action_dim)
+        # Model hyper-parameters (override-able from config)
+        self._tubelet_size = int(self._vjepa_cfg.get("tubelet_size", 2))
+        self._patch_size = int(self._vjepa_cfg.get("patch_size", 16))
+        self._context_len = int(self._vjepa_cfg.get("pred_context_len", 16))
+        self._encoder_arch = self._vjepa_cfg.get("encoder_arch", "vit_large")
+        self._encoder_embed_dim = int(self._vjepa_cfg.get("encoder_embed_dim", 1024))
+        raw_pred_dim = self._vjepa_cfg.get("predictor_embed_dim")
+        self._predictor_embed_dim_override = raw_pred_dim not in (None, 0)
+        self._predictor_embed_dim = (
+            int(raw_pred_dim)
+            if self._predictor_embed_dim_override
+            else self._encoder_embed_dim
         )
-        # Space adapter to map ViT-L features (1024) to ViT-g features (1408)
-        self.space_adapter = nn.Sequential(
-            nn.Linear(1024, 1408),
-            nn.ReLU(),
-            nn.Linear(1408, 1408)
+        self._predictor_depth = int(self._vjepa_cfg.get("predictor_depth", 24))
+        self._predictor_heads = int(self._vjepa_cfg.get("predictor_heads", 16))
+        self._predictor_is_frame_causal = self._vjepa_cfg.get(
+            "predictor_is_frame_causal", True
+        )
+        self._predictor_use_rope = self._vjepa_cfg.get("use_rope", True)
+        self._predictor_use_silu = self._vjepa_cfg.get("use_predictor_silu", False)
+        self._predictor_wide_silu = self._vjepa_cfg.get("predictor_wide_silu", True)
+        self._predictor_drop_rate = self._vjepa_cfg.get("predictor_drop_rate", 0.0)
+        self._predictor_attn_drop_rate = self._vjepa_cfg.get(
+            "predictor_attn_drop_rate", 0.0
+        )
+        self._predictor_drop_path_rate = self._vjepa_cfg.get(
+            "predictor_drop_path_rate", 0.0
+        )
+        self._predictor_use_checkpointing = self._vjepa_cfg.get("checkpointing", False)
+        requested_checkpointing = self._vjepa_cfg.get("gradient_checkpointing")
+        if requested_checkpointing is not None:
+            if requested_checkpointing and config.freeze_vjepa_predictor:
+                print(
+                    "Gradient checkpointing requested but predictor is frozen; disabling checkpointing to maintain gradients."
+                )
+                self._predictor_use_checkpointing = False
+            else:
+                self._predictor_use_checkpointing = bool(requested_checkpointing)
+        elif config.freeze_vjepa_predictor and self._predictor_use_checkpointing:
+            print("Disabling V-JEPA predictor activation checkpointing to preserve gradients.")
+            self._predictor_use_checkpointing = False
+        self._predictor_use_extrinsics = self._vjepa_cfg.get("use_extrinsics", False)
+
+        # Action conditioning dims (default to the environment space)
+        cfg_action_dim: Optional[int] = self._vjepa_cfg.get("action_embed_dim")
+        self._action_embed_dim = (
+            int(cfg_action_dim) if cfg_action_dim not in (None, 0) else self._action_size
+        )
+        raw_state_dim = self._vjepa_cfg.get("state_embed_dim")
+        self._state_embed_dim = (
+            int(raw_state_dim)
+            if raw_state_dim not in (None, -1)
+            else self._action_embed_dim
+        )
+        self._action_dim_warning_emitted = False
+        self._state_dim_warning_emitted = False
+
+        # --- V-JEPA Models ---
+        self.vjepa_encoder = self._load_vjepa_encoder(
+            config.vjepa_encoder_path, config.freeze_vjepa_encoder
+        )
+        self.ac_predictor = self._load_ac_predictor(
+            config.vjepa_ac_path, config.freeze_vjepa_predictor
         )
 
         # --- DreamerV3 Heads ---
-        # The feature size is the output dimension of the V-JEPA encoder
-        feat_size = 1408 # For ViT-g
         self.heads = nn.ModuleDict()
+        feat_size = self._encoder_embed_dim
         self.heads["reward"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
@@ -92,48 +144,57 @@ class VJEPAWorldModel(nn.Module):
 
         # --- Optimizers ---
         self._model_opt = tools.Optimizer(
-            "model", self.heads.parameters(), config.model_lr, config.opt_eps, config.grad_clip,
-            config.weight_decay, opt=config.opt, use_amp=self._use_amp)
-
-        adapter_params = itertools.chain(self.action_adapter.parameters(), self.space_adapter.parameters())
-        self._adapter_opt = tools.Optimizer(
-            "adapter", adapter_params, lr=config.vjepa['adapter_lr'], eps=config.vjepa['adapter_eps'], clip=config.vjepa['adapter_grad_clip'],
-            wd=config.vjepa['adapter_wd'], opt=config.opt, use_amp=self._use_amp)
+            "model",
+            self.heads.parameters(),
+            config.model_lr,
+            config.opt_eps,
+            config.grad_clip,
+            config.weight_decay,
+            opt=config.opt,
+            use_amp=self._use_amp,
+        )
 
         self.reward_manager = tools.RewardManager(config)
-        
+
         print("VJEPA World Model Initialized.")
-        print(f"Trainable parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}")
+        print(
+            f"Trainable parameters: {sum(p.numel() for p in self.parameters() if p.requires_grad)}"
+        )
 
     def _load_vjepa_encoder(self, path, freeze):
         print(f"Loading V-JEPA encoder from {path}")
-        # Hardcoding ViT-g for now, can be made configurable
-        encoder = vjepa2_vit_large(pretrained=False)[0] # Create model instance
-        
-        if self._config.vjepa.get('use_dummy_models', False):
+
+        if self._config.vjepa.get("use_dummy_models", False):
             print("Using dummy V-JEPA encoder.")
+            encoder = nn.Identity()
+            self._encoder_embed_dim = self._encoder_embed_dim or 1024
             return encoder
+
+        if self._encoder_arch != "vit_large":
+            raise ValueError(f"Unsupported V-JEPA encoder arch: {self._encoder_arch}")
+
+        encoder = vjepa2_vit_large(pretrained=False)[0]
 
         if path and Path(path).exists():
             try:
-                ckpt = torch.load(path, map_location='cpu')
-                # The vitg.pt checkpoint is a dictionary, not a raw state dict
-                if 'encoder' in ckpt:
-                    encoder_ckpt = ckpt['encoder']
-                elif 'model' in ckpt:
-                    encoder_ckpt = ckpt['model']
+                ckpt = torch.load(path, map_location="cpu")
+                if "encoder" in ckpt:
+                    encoder_ckpt = ckpt["encoder"]
+                elif "model" in ckpt:
+                    encoder_ckpt = ckpt["model"]
                 else:
                     encoder_ckpt = ckpt
-                # Clean keys from prefixes
                 cleaned_ckpt = {}
                 for k, v in encoder_ckpt.items():
-                    k = k.replace('module.', '')
-                    k = k.replace('backbone.', '')
+                    k = k.replace("module.", "")
+                    k = k.replace("backbone.", "")
                     cleaned_ckpt[k] = v
                 encoder.load_state_dict(cleaned_ckpt, strict=True)
                 print("Encoder weights loaded successfully.")
             except Exception as e:
                 print(f"ERROR: Could not load encoder weights: {e}")
+        else:
+            print("Warning: Encoder checkpoint not found. Using randomly initialized encoder.")
 
         if freeze:
             for param in encoder.parameters():
@@ -141,51 +202,132 @@ class VJEPAWorldModel(nn.Module):
             encoder.eval()
             print("V-JEPA encoder is frozen.")
 
-        # Move to device
         encoder.to(self._config.device)
         if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for V-JEPA encoder via DataParallel.")
+            print(
+                f"Using {torch.cuda.device_count()} GPUs for V-JEPA encoder via DataParallel."
+            )
             encoder = nn.DataParallel(encoder)
 
+        actual_embed_dim = self._extract_embed_dim(encoder)
+        if actual_embed_dim != self._encoder_embed_dim:
+            print(
+                f"Updating encoder feature dim from {self._encoder_embed_dim} to {actual_embed_dim}."
+            )
+            self._encoder_embed_dim = actual_embed_dim
+            if not self._predictor_embed_dim_override:
+                self._predictor_embed_dim = actual_embed_dim
+
         return encoder
+
+    def _extract_embed_dim(self, encoder_module) -> int:
+        module = encoder_module.module if isinstance(encoder_module, nn.DataParallel) else encoder_module
+        if hasattr(module, "embed_dim"):
+            return int(module.embed_dim)
+        if hasattr(module, "encoder") and hasattr(module.encoder, "embed_dim"):
+            return int(module.encoder.embed_dim)
+        if hasattr(module, "head") and hasattr(module.head, "weight"):
+            return int(module.head.weight.shape[1])
+        return int(self._encoder_embed_dim)
+
+    def _match_feature_dim(self, tensor, target_dim, warn_attr, label):
+        current_dim = tensor.shape[-1]
+        if current_dim == target_dim:
+            return tensor
+        if current_dim > target_dim:
+            if label == "action":
+                remainder = tensor[..., target_dim:]
+                # Common case: padded zeros beyond the expected button slots.
+                if remainder.abs().max().item() < 1e-6:
+                    return tensor[..., :target_dim]
+                combos = current_dim
+                bits = int(round(math.log2(combos)))
+                if 2**bits == combos and bits == target_dim:
+                    indices = torch.argmax(tensor, dim=-1)
+                    bit_indices = torch.arange(bits, device=tensor.device)
+                    multi_hot = ((indices.unsqueeze(-1) >> bit_indices) & 1).to(tensor.dtype)
+                    return multi_hot
+            if not getattr(self, warn_attr):
+                print(
+                    f"Truncating {label} features from {current_dim} to {target_dim} to match V-JEPA predictor."
+                )
+                setattr(self, warn_attr, True)
+            return tensor[..., :target_dim]
+        pad = target_dim - current_dim
+        if not getattr(self, warn_attr):
+            print(
+                f"Padding {label} features from {current_dim} to {target_dim} with zeros to match V-JEPA predictor."
+            )
+            setattr(self, warn_attr, True)
+        return F.pad(tensor, (0, pad))
+
+    def _prepare_states(self, data, reference_tensor):
+        state_key = self._vjepa_cfg.get("state_tensor_key")
+        candidate = None
+        for key in filter(None, [state_key, "state", "game_state"]):
+            if key and key in data:
+                candidate = data[key]
+                break
+        if candidate is None:
+            B, T, _ = reference_tensor.shape
+            return torch.zeros(
+                B, T, self._state_embed_dim, device=reference_tensor.device
+            )
+        if candidate.dim() == 2:
+            candidate = candidate.unsqueeze(1)
+        candidate = candidate[:, :: self._tubelet_size]
+        candidate = candidate.to(reference_tensor.device).to(reference_tensor.dtype)
+        return self._match_feature_dim(
+            candidate, self._state_embed_dim, "_state_dim_warning_emitted", "state"
+        )
 
     def _load_ac_predictor(self, path, freeze):
         print(f"Loading V-JEPA AC predictor from {path}")
 
-        # The checkpoint expects specific dimensions. We hardcode them here.
-        original_action_dim = 7
-        original_state_dim = 7
-        original_extrinsics_dim = 6
-        self._original_action_dim = original_action_dim
+        if self._config.vjepa.get("use_dummy_models", False):
+            print("Using dummy AC predictor.")
+            predictor = _IdentityPredictor()
+            return predictor
 
-        # Instantiate the model with the correct dimensions BEFORE loading weights
         predictor = vit_ac_predictor(
             img_size=self._config.size,
-            patch_size=16,
+            patch_size=self._patch_size,
             num_frames=self._config.batch_length,
-            embed_dim=1408, 
-            predictor_embed_dim=1024, 
-            depth=24, 
-            num_heads=16,
-            use_rope=True, 
-            action_embed_dim=original_action_dim,
-            state_embed_dim=original_state_dim,
-            extrinsics_embed_dim=original_extrinsics_dim,
-            use_activation_checkpointing=self._config.vjepa['checkpointing'])
+            tubelet_size=self._tubelet_size,
+            embed_dim=self._encoder_embed_dim,
+            predictor_embed_dim=self._predictor_embed_dim,
+            depth=self._predictor_depth,
+            num_heads=self._predictor_heads,
+            use_rope=self._predictor_use_rope,
+            use_activation_checkpointing=self._predictor_use_checkpointing,
+            is_frame_causal=self._predictor_is_frame_causal,
+            action_embed_dim=self._action_embed_dim,
+            drop_rate=self._predictor_drop_rate,
+            attn_drop_rate=self._predictor_attn_drop_rate,
+            drop_path_rate=self._predictor_drop_path_rate,
+            use_silu=self._predictor_use_silu,
+            wide_silu=self._predictor_wide_silu,
+            use_extrinsics=self._predictor_use_extrinsics,
+        )
 
-        if self._config.vjepa.get('use_dummy_models', False):
-            print("Using dummy AC predictor.")
-        elif path and Path(path).exists():
+        if path and Path(path).exists():
             try:
-                full_ckpt = torch.load(path, map_location='cpu')
-                pred_ckpt = full_ckpt['predictor']
-                pred_ckpt = {k.replace('module.', ''): v for k, v in pred_ckpt.items()}
+                full_ckpt = torch.load(path, map_location="cpu")
+                if "predictor" in full_ckpt:
+                    pred_ckpt = full_ckpt["predictor"]
+                elif "state_dict" in full_ckpt:
+                    pred_ckpt = full_ckpt["state_dict"]
+                else:
+                    pred_ckpt = full_ckpt
+                pred_ckpt = {k.replace("module.", ""): v for k, v in pred_ckpt.items()}
                 predictor.load_state_dict(pred_ckpt, strict=True)
-                print("AC Predictor weights loaded successfully.")
+                print("AC predictor weights loaded successfully.")
             except Exception as e:
                 print(f"ERROR: Could not load predictor weights: {e}")
         else:
-            print("Warning: Predictor checkpoint not found. Using randomly initialized predictor.")
+            print(
+                "Warning: Predictor checkpoint not found. Using randomly initialized predictor."
+            )
 
         if freeze:
             for param in predictor.parameters():
@@ -193,89 +335,100 @@ class VJEPAWorldModel(nn.Module):
             predictor.eval()
             print("V-JEPA AC predictor is fully frozen.")
 
-        # Move to device
         predictor.to(self._config.device)
         if torch.cuda.device_count() > 1:
-            print(f"Using {torch.cuda.device_count()} GPUs for V-JEPA AC predictor via DataParallel.")
+            print(
+                f"Using {torch.cuda.device_count()} GPUs for V-JEPA AC predictor via DataParallel."
+            )
             predictor = nn.DataParallel(predictor)
-        
+
         return predictor
 
     def _train(self, data):
-        # print(f"DEBUG: VJEPAWorldModel._train START, type(self.heads['cont']): {type(self.heads['cont'])}")
         data = self.preprocess(data)
 
         with tools.CPUTimeRecording("wm_train_encode"):
             with torch.inference_mode():
                 with torch.cuda.amp.autocast(self._use_amp):
-                    z_patches_raw = self.encode(data)
-            z_patches = self.space_adapter(z_patches_raw)
+                    z_patches = self.encode(data)
 
         with tools.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
-                B, T, H, W, C = data['image'].shape
-                tubelet_size = 2
-                patch_size = 16
-                T_patches = T // tubelet_size
-                H_patches = H // patch_size
-                W_patches = W // patch_size
-                D = z_patches.shape[-1]
+                B, T, H, W, _ = data["image"].shape
+                if T % self._tubelet_size != 0:
+                    raise ValueError(
+                        f"Batch length {T} must be divisible by tubelet_size {self._tubelet_size}."
+                    )
+                if H % self._patch_size != 0 or W % self._patch_size != 0:
+                    raise ValueError(
+                        f"Image spatial dims {(H, W)} must be divisible by patch_size {self._patch_size}."
+                    )
 
+                T_patches = T // self._tubelet_size
+                H_patches = H // self._patch_size
+                W_patches = W // self._patch_size
+                D = z_patches.shape[-1]
                 num_spatial_patches = H_patches * W_patches
                 z_seq_patches = z_patches.view(B, T_patches, num_spatial_patches, D)
 
-                actions_sub = data['action'][:, ::tubelet_size]
-                B, T_sub, _ = actions_sub.shape
-                dummy_states = torch.zeros(B, T_sub, 7, device=actions_sub.device)
+                actions_sub = data["action"][:, :: self._tubelet_size]
+                actions_for_pred = self._match_feature_dim(
+                    actions_sub,
+                    self._action_embed_dim,
+                    "_action_dim_warning_emitted",
+                    "action",
+                )
+                states_for_pred = self._prepare_states(data, actions_for_pred)
 
-                context_len = self._config.vjepa['pred_context_len']
-                predictor_input = z_seq_patches[:, -context_len-1:-1].flatten(1, 2)
-
-                actions_for_pred = actions_sub[:, -context_len-1:-1]
-                states_for_pred = dummy_states[:, -context_len-1:-1]
-
-                adapted_actions = self.action_adapter(actions_for_pred)
+                max_context = min(self._context_len, z_seq_patches.shape[1] - 1)
+                if max_context <= 0:
+                    raise ValueError(
+                        "Context length must be at least 1 after accounting for available frames."
+                    )
+                predictor_input = z_seq_patches[:, -max_context - 1 : -1].flatten(1, 2)
+                actions_ctx = actions_for_pred[:, -max_context - 1 : -1]
+                states_ctx = states_for_pred[:, -max_context - 1 : -1]
 
                 with tools.CPUTimeRecording("wm_train_ac_predictor"):
-                    z_pred_patches = self.ac_predictor(predictor_input, adapted_actions, states_for_pred)
-
-                z_target_patches = z_seq_patches[:, -context_len:].flatten(1, 2).detach()
+                    z_pred_patches = self.ac_predictor(
+                        predictor_input, actions_ctx, states_ctx
+                    )
+                z_target_patches = (
+                    z_seq_patches[:, -max_context:].flatten(1, 2).detach()
+                )
                 pred_loss = F.l1_loss(z_pred_patches, z_target_patches)
 
                 z_seq_agg = z_seq_patches.mean(dim=2)
                 feats = z_seq_agg.detach()
-                
-                # Compute reward based on the selected mode
-                reward_data = self.reward_manager.compute_reward(
-                    base_reward=data['reward'], 
-                    done=data['is_terminal'], 
-                    obs=data['image']
-                )
-                reward_data = reward_data[:, ::tubelet_size]
 
-                cont_data = data['cont'][:, ::tubelet_size]
+                reward_data = self.reward_manager.compute_reward(
+                    base_reward=data["reward"],
+                    done=data["is_terminal"],
+                    obs=data["image"],
+                )
+                reward_data = reward_data[:, :: self._tubelet_size]
+                cont_data = data["cont"][:, :: self._tubelet_size]
 
                 head_losses = {}
-                pred_reward = self.heads['reward'](feats)
-                head_losses['reward'] = -pred_reward.log_prob(reward_data).mean()
+                pred_reward = self.heads["reward"](feats)
+                head_losses["reward"] = -pred_reward.log_prob(reward_data).mean()
 
-                pred_cont = self.heads['cont'](feats)
-                head_losses['cont'] = -pred_cont.log_prob(cont_data).mean()
+                pred_cont = self.heads["cont"](feats)
+                head_losses["cont"] = -pred_cont.log_prob(cont_data).mean()
 
-                adapter_loss = pred_loss
-                model_loss = head_losses['reward'] + head_losses['cont']
+                model_loss = head_losses["reward"] + head_losses["cont"]
 
-            with tools.CPUTimeRecording("wm_train_adapter_opt"):
-                metrics = self._adapter_opt(adapter_loss, self.action_adapter.parameters())
             with tools.CPUTimeRecording("wm_train_model_opt"):
-                metrics.update(self._model_opt(model_loss, self.heads.parameters()))
+                metrics = self._model_opt(model_loss, self.heads.parameters())
 
-        metrics.update({f'{name}_loss': loss.item() for name, loss in head_losses.items()})
-        metrics['vjepa_pred_loss'] = pred_loss.item()
+        metrics.update({f"{name}_loss": loss.item() for name, loss in head_losses.items()})
+        metrics["vjepa_pred_loss"] = pred_loss.item()
 
         start_z_agg = z_seq_patches[:, 0].mean(dim=1).detach()
-        start_state = {'feat': start_z_agg, 'patches': z_seq_patches[:, 0].detach()}
-        # print(f"DEBUG: VJEPAWorldModel._train END, type(self.heads['cont']): {type(self.heads['cont'])}")
+        start_state = {
+            "feat": start_z_agg,
+            "patches": z_seq_patches[:, 0].detach(),
+        }
         return start_state, {"feat": start_z_agg}, metrics
 
     def encode(self, obs):
@@ -313,16 +466,19 @@ class VJEPAWorldModel(nn.Module):
         # We treat the spatial patches as the sequence.
         B, N_s, D = z_patches.shape
         
-        # Adapt the action to the predictor's expected dimension
-        with torch.no_grad(): # Adapter is trained in the _train step
-            adapted_action = self.action_adapter(action)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
+        action = action.to(z_patches.device).float()
+        action = action.unsqueeze(1)
+        action = self._match_feature_dim(
+            action, self._action_embed_dim, "_action_dim_warning_emitted", "action"
+        )
 
-        # Reshape action to (B, 1, A_size) for the ac_predictor
-        action_reshaped = adapted_action.unsqueeze(1) # (B, 1, A_size)
-        dummy_state = torch.zeros(B, 1, 7, device=action_reshaped.device)
+        state_tokens = torch.zeros(
+            B, 1, self._state_embed_dim, device=z_patches.device, dtype=z_patches.dtype
+        )
 
-        # Predict next patches
-        next_z_patches = self.ac_predictor(z_patches, action_reshaped, dummy_state)
+        next_z_patches = self.ac_predictor(z_patches, action, state_tokens)
         return next_z_patches
 
     def preprocess(self, obs):
@@ -345,3 +501,7 @@ class VJEPAWorldModel(nn.Module):
     def on_episode_end(self):
         """Called at the end of an episode to reset components like the reward generator."""
         self.reward_manager.reset_generator()
+
+    @property
+    def feature_dim(self):
+        return self._encoder_embed_dim

@@ -221,7 +221,7 @@ class ImagBehavior(nn.Module):
         self._config = config
         self._world_model = world_model
         if isinstance(world_model, WorldModel): # VJEPAWorldModel
-            feat_size = 1408
+            feat_size = world_model.feature_dim
         else: # Original RSSMWorldModel
             if config.dyn_discrete:
                 feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter

@@ -192,7 +192,11 @@ def simulate(
         action, agent_state = agent(obs, done, agent_state)
         if isinstance(action, dict):
             action = [
-                {k: np.array(action[k][i].detach().cpu()) for k in action}
+                {
+                    k: np.array(action[k][i].detach().cpu())
+                    for k in action
+                    if k not in {"logprob", "logits"}
+                }
                 for i in range(len(envs))
             ]
         else:
@@ -295,18 +299,18 @@ def simulate(
 
 
 def add_to_cache(cache, id, transition):
+    transition = {k: v for k, v in transition.items() if k not in {"logprob", "logits"}}
     if id not in cache:
         cache[id] = dict()
         for key, val in transition.items():
             cache[id][key] = [convert(val)]
     else:
+        current_len = len(next(iter(cache[id].values())))
         for key, val in transition.items():
             if key not in cache[id]:
-                # fill missing data(action, etc.) at second time
-                cache[id][key] = [convert(0 * val)]
-                cache[id][key].append(convert(val))
-            else:
-                cache[id][key].append(convert(val))
+                zero = np.zeros_like(convert(val))
+                cache[id][key] = [zero.copy() for _ in range(current_len)]
+            cache[id][key].append(convert(val))
 
 
 def erase_over_episodes(cache, dataset_size):
@@ -361,7 +365,14 @@ def from_generator(generator, batch_size):
             data[key] = []
             for i in range(batch_size):
                 data[key].append(batch[i][key])
-            data[key] = np.stack(data[key], 0)
+            try:
+                data[key] = np.stack(data[key], 0)
+            except ValueError as err:
+                shapes = [np.asarray(sample).shape for sample in data[key]]
+                dtypes = [np.asarray(sample).dtype for sample in data[key]]
+                raise ValueError(
+                    f"Cannot stack key '{key}' with element shapes {shapes} and dtypes {dtypes}"
+                ) from err
         yield data
 
 
@@ -410,12 +421,38 @@ def load_episodes(directory, limit=None, reverse=True):
     directory = pathlib.Path(directory).expanduser()
     episodes = collections.OrderedDict()
     total = 0
+    def _normalize_episode(episode):
+        lengths = {
+            key: value.shape[0]
+            for key, value in episode.items()
+            if hasattr(value, "shape") and value.ndim > 0
+        }
+        if not lengths:
+            return episode
+        target = max(lengths.values())
+        for key, value in episode.items():
+            if not hasattr(value, "shape") or value.ndim == 0:
+                continue
+            length = value.shape[0]
+            if length == target:
+                continue
+            if length > target:
+                episode[key] = value[:target]
+                continue
+            pad = target - length
+            pad_shape = (pad,) + value.shape[1:]
+            pad_values = np.zeros(pad_shape, dtype=value.dtype)
+            episode[key] = np.concatenate([pad_values, value], axis=0)
+        return episode
     if reverse:
         for filename in reversed(sorted(directory.glob("*.npz"))):
             try:
                 with filename.open("rb") as f:
                     episode = np.load(f)
                     episode = {k: episode[k] for k in episode.keys()}
+                    episode.pop("logprob", None)
+                    episode.pop("logits", None)
+                    episode = _normalize_episode(episode)
             except Exception as e:
                 print(f"Could not load episode: {e}")
                 continue
@@ -430,6 +467,9 @@ def load_episodes(directory, limit=None, reverse=True):
                 with filename.open("rb") as f:
                     episode = np.load(f)
                     episode = {k: episode[k] for k in episode.keys()}
+                    episode.pop("logprob", None)
+                    episode.pop("logits", None)
+                    episode = _normalize_episode(episode)
             except Exception as e:
                 print(f"Could not load episode: {e}")
                 continue

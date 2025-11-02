@@ -96,7 +96,6 @@ class Dreamer(torch.nn.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
             
-        logprob = actor.log_prob(action)
         latent = {k: v.detach() for k, v in latent.items()}
         action = action.detach()
         
@@ -105,7 +104,7 @@ class Dreamer(torch.nn.Module):
                 torch.argmax(action, dim=-1), self._config.num_actions
             )
         
-        policy_output = {"action": action, "logprob": logprob}
+        policy_output = {"action": action, "logits": actor.logits}
         state = (latent, action)
         return policy_output, state
 

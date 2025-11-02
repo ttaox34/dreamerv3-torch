@@ -125,8 +125,7 @@ class Dreamer(nn.Module):
             action = dist.sample()
         else:
             action = dist.mode()
-        logprob = dist.log_prob(action)
-        
+
         if hasattr(self._wm, 'vjepa_encoder'):
             state = (latent.detach(), action.detach())
         else:
@@ -360,8 +359,7 @@ def main(config):
 
         def random_agent(o, d, s):
             action = random_actor.sample()
-            logprob = random_actor.log_prob(action)
-            return {"action": action, "logprob": logprob}, None
+            return {"action": action}, None
 
         state = tools.simulate(
             random_agent,
